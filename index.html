@@ -2563,6 +2563,13 @@
                     return best;
                 }
 
+                // Initial pathIdx: ~6 path points past the start line in the
+                // direction of travel. Using raw "nearest" on the back-row
+                // formation position can snap to the wrong leg of the track
+                // (especially on figure-8), making the AI drive in circles.
+                const startLineIdx = nearestPathIdx(cp.col, cp.row);
+                const initialPathIdx = (startLineIdx + 6) % totalPts;
+
                 // AI cars take positions 0, 1, 2 (front row left, front row right, back row left)
                 for (let i = 0; i < 3; i++) {
                     const pos = formation[i];
@@ -2573,7 +2580,8 @@
                         prevRow: pos.row,
                         angle: angle,
                         speed: 0,
-                        pathIdx: nearestPathIdx(pos.col, pos.row),
+                        pathIdx: initialPathIdx,
+                        reachedFarSide: false,
                         airHeight: 0,
                         vertVel: 0,
                         jumpBaseH: 0,
@@ -2594,8 +2602,9 @@
                     ai.prevCol = ai.col;
                     ai.prevRow = ai.row;
 
-                    // Target: look ahead on the path
-                    const lookAhead = 8;
+                    // Target: look further ahead at higher speeds so fast AI
+                    // (Gold at maxSpeed 18) don't oscillate trying to hit waypoints
+                    const lookAhead = Math.round(8 + ai.maxSpeed * 0.25);
                     const targetIdx = (ai.pathIdx + lookAhead) % totalPts;
                     const target = racePath[targetIdx];
 
@@ -2639,6 +2648,15 @@
                     } else if (d > 8) {
                         // Too far from expected path point — re-snap to nearest
                         snapAIToNearestPath(ai);
+                    }
+
+                    // Mark "far side reached" when the AI's path progress is
+                    // in the middle third of the track (40%–70% along the loop).
+                    // This is used to validate genuine laps on figure-8 tracks
+                    // where the start/finish line can be crossed at the intersection.
+                    const relIdx = ai.pathIdx / totalPts;
+                    if (relIdx > 0.4 && relIdx < 0.7) {
+                        ai.reachedFarSide = true;
                     }
 
                     // Jump physics (same as player)
@@ -2696,8 +2714,14 @@
                         const g1c = cp.col + cp.nx * cp.dPos, g1r = cp.row + cp.ny * cp.dPos;
                         const g2c = cp.col - cp.nx * cp.dNeg, g2r = cp.row - cp.ny * cp.dNeg;
                         if (segmentsIntersect(ai.prevCol, ai.prevRow, ai.col, ai.row, g1c, g1r, g2c, g2r)) {
-                            if (ai.crossedStart) {
+                            // Require that the AI actually reached the far side
+                            // of the track since the last crossing. On figure-8
+                            // tracks the gate can be crossed multiple times per
+                            // lap at the intersection; this ensures only real
+                            // laps are counted.
+                            if (ai.crossedStart && ai.reachedFarSide) {
                                 ai.lap++;
+                                ai.reachedFarSide = false;
                                 if (ai.lap >= TOTAL_LAPS) {
                                     const already = race.results.find(r => r.name === AI_NAMES[ai.colorIdx]);
                                     if (!already) {
@@ -3836,6 +3860,36 @@
                 engineNodes.masterGain.gain.value = cfg.masterVolume;
                 engineNodes.presence.gain.value = cfg.presenceGain;
                 engineNodes.warmth.gain.value = cfg.warmthGain;
+
+                // When the player has finished (or race ended), force idle.
+                // The frozen update branch doesn't tick jump physics, so stale
+                // `airborne` flags would otherwise pin the engine at full rev.
+                const playerDone = !!race.results.find(r => r.name === 'Player');
+                if (race.finished || playerDone || isCountingDown()) {
+                    engineNodes.playerEngine.targetThrottle = 0.05;
+                    engineNodes.playerEngine.volume = 1.0;
+                    for (let i = 0; i < aiCars.length && i < aiEngineNodes.length; i++) {
+                        const ai = aiCars[i];
+                        if (race.finished || isCountingDown()) {
+                            aiEngineNodes[i].targetThrottle = 0.05;
+                            aiEngineNodes[i].volume = 0;
+                        } else {
+                            // Grace window: AI still driving, keep their engines live
+                            const dx = ai.col - car.col, dy = ai.row - car.row;
+                            const dist = Math.sqrt(dx * dx + dy * dy);
+                            const maxHearDist = 30;
+                            if (dist < maxHearDist) {
+                                const proximity = 1 - dist / maxHearDist;
+                                aiEngineNodes[i].targetThrottle = Math.abs(ai.speed) / ai.maxSpeed;
+                                aiEngineNodes[i].volume = proximity * proximity * 2.5;
+                            } else {
+                                aiEngineNodes[i].targetThrottle = 0;
+                                aiEngineNodes[i].volume = 0;
+                            }
+                        }
+                    }
+                    return;
+                }
 
                 // Player throttle: normal driving tops out at 0.6, leaving headroom
                 // for airborne rev spikes to be clearly audible
