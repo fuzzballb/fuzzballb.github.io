@@ -180,6 +180,7 @@
             const CAR_TYPES = [
                 {
                     name: "ZIPPY",
+                    num: 7,
                     desc: "The balanced little legend",
                     shape: "compact",
                     cylinders: 4,
@@ -199,6 +200,7 @@
                 },
                 {
                     name: "STING",
+                    num: 4,
                     desc: "Slot-car grip, rocket pace",
                     shape: "formula",
                     cylinders: 6,
@@ -218,6 +220,7 @@
                 },
                 {
                     name: "BRUISER",
+                    num: 8,
                     desc: "V8 muscle, loves to slide",
                     shape: "muscle",
                     cylinders: 8,
@@ -260,6 +263,7 @@
             const AI_POOL = [
                 {
                     name: "BAZZA",
+                    num: 2,
                     shape: "muscle",
                     colors: {
                         top: "#2080e0",
@@ -270,6 +274,7 @@
                 },
                 {
                     name: "RIKKI",
+                    num: 3,
                     shape: "compact",
                     colors: {
                         top: "#20c040",
@@ -280,6 +285,7 @@
                 },
                 {
                     name: "MAUDE",
+                    num: 5,
                     shape: "formula",
                     colors: {
                         top: "#e0a020",
@@ -290,6 +296,7 @@
                 },
                 {
                     name: "VINNIE",
+                    num: 6,
                     shape: "muscle",
                     colors: {
                         top: "#d04898",
@@ -300,6 +307,7 @@
                 },
                 {
                     name: "PEARL",
+                    num: 9,
                     shape: "compact",
                     colors: {
                         top: "#20c0b0",
@@ -310,6 +318,7 @@
                 },
                 {
                     name: "DUSTY",
+                    num: 1,
                     shape: "formula",
                     colors: {
                         top: "#c87838",
@@ -3008,6 +3017,7 @@
                         jumpBaseH: 0,
                         airborne: false,
                         name: drv.name,
+                        num: drv.num,
                         colors: drv.colors,
                         shape: drv.shape,
                         maxSpeed: baseSpeed + i * 1.6,
@@ -3208,7 +3218,9 @@
                         { f: -0.8, w: 0.46, sh: 0.4, tw: 0.3, h: 0.62 },
                     ],
                     glass: { 1: "full", 2: "side", 3: "full" },
-                    wheels: { r: 3.5, front: 0.55, back: -0.5, side: 0.56 },
+                    wheels: { r: 6.0, front: 0.55, back: -0.5, side: 0.58 },
+                    ride: 0.5,
+                    decal: { f: -0.15, h: 0.95, slope: -0.03, size: 0.55 },
                     lights: true,
                 },
                 muscle: {
@@ -3221,7 +3233,9 @@
                         { f: -1.06, w: 0.5, sh: 0.44, tw: 0.36, h: 0.58 },
                     ],
                     glass: { 2: "full", 3: "side", 4: "full" },
-                    wheels: { r: 3.8, front: 0.7, back: -0.68, side: 0.62 },
+                    wheels: { r: 7.0, front: 0.72, back: -0.7, side: 0.64 },
+                    ride: 0.58,
+                    decal: { f: 0.44, h: 0.48, slope: -0.06, size: 0.6 },
                     lights: true,
                     scoop: true,
                     spoiler: {
@@ -3241,7 +3255,9 @@
                         { f: -1.04, w: 0.26, sh: 0.3, tw: 0.08, h: 0.42 },
                     ],
                     glass: { 2: "full" },
-                    wheels: { r: 4.2, front: 0.74, back: -0.7, side: 0.52 },
+                    wheels: { r: 6.4, front: 0.78, back: -0.74, side: 0.46 },
+                    ride: 0.26,
+                    decal: { f: 0.8, h: 0.28, slope: -0.19, size: 0.34 },
                     lights: false,
                     frontWing: {
                         f0: 1.04,
@@ -3267,7 +3283,8 @@
                         { f: -0.8, w: 0.46, sh: 0.46, tw: 0.32, h: 0.7 },
                     ],
                     glass: {},
-                    wheels: { r: 3.2, front: 0.53, back: -0.53, side: 0.52 },
+                    wheels: { r: 5.2, front: 0.53, back: -0.53, side: 0.62 },
+                    ride: 0.44,
                     lights: false,
                     pig: true,
                 },
@@ -3302,14 +3319,14 @@
             // lighting, so winding order never matters.
             const CAR_LIGHT = [0.3, 0.74, 0.6];
             const CAR_VIEW = [0.53, 0.53, 0.63];
-            const GLASS_COLOR = "#9fd4f2";
+            const GLASS_COLOR = "#16181e";
             // Visual size multiplier for all cars (mesh, wheels, trim)
             const CAR_SCALE = 1.5;
             // Extra vertical stretch so the bodies don't look flattened by
             // the isometric projection
             const CAR_TALL = 1.3;
 
-            function drawCarGeneric(carObj, colors, shape = "compact") {
+            function drawCarGeneric(carObj, colors, shape = "compact", num) {
                 const dx = Math.cos(carObj.angle),
                     dy = Math.sin(carObj.angle);
                 const px = -dy,
@@ -3388,33 +3405,13 @@
                 ctx.fillStyle = "rgba(0,0,0,0.25)";
                 ctx.fill();
 
-                // Wheels
                 const wh = mesh.wheels;
-                for (const [f, s] of [
-                    [wh.front, wh.side],
-                    [wh.front, -wh.side],
-                    [wh.back, wh.side],
-                    [wh.back, -wh.side],
-                ]) {
-                    const wp = carPt(f, s, 0.1);
-                    ctx.beginPath();
-                    ctx.arc(wp[0], wp[1], wh.r * CAR_SCALE, 0, Math.PI * 2);
-                    ctx.fillStyle = "#222";
-                    ctx.fill();
-                    ctx.beginPath();
-                    ctx.arc(
-                        wp[0],
-                        wp[1],
-                        wh.r * 0.5 * CAR_SCALE,
-                        0,
-                        Math.PI * 2,
-                    );
-                    ctx.fillStyle = "#555";
-                    ctx.fill();
-                }
 
                 // Collect shaded faces, painter-sort, draw back-to-front.
-                // lp = local [fwd, side, up] points.
+                // lp = local [fwd, side, up] points. The body floats `ride`
+                // above the wheels, like the high-riding original sprites;
+                // wheels and shadow stay on the ground.
+                const ride = mesh.ride || 0;
                 const faces = [];
                 function addFace(lp, baseColor) {
                     const ax = lp[1][0] - lp[0][0],
@@ -3455,7 +3452,7 @@
                         depth +=
                             dx * p[0] + px * p[1] + dy * p[0] + py * p[1];
                     faces.push({
-                        pts: lp.map((p) => carPt(p[0], p[1], p[2])),
+                        pts: lp.map((p) => carPt(p[0], p[1], p[2] + ride)),
                         depth: depth / lp.length,
                         color: hexShade(baseColor, 0.38 + 0.88 * lit),
                     });
@@ -3596,10 +3593,105 @@
                     }
                 }
 
+                // Wheels join the painter sort so the near-side pair drawn
+                // last overlaps the body, like the fat tires on the original
+                // sprites. The axle height puts the tire bottom on the ground.
+                // Each wheel is a disc in the car's forward/up plane, so on
+                // screen it is an ellipse aligned with the projected forward
+                // axis — it tilts and foreshortens as the car turns instead
+                // of always facing the camera.
+                const axleUp = wh.r / (TILE_DEPTH * CAR_TALL);
+                const fwdSx = (dx - dy) * (TILE_W / 2),
+                    fwdSy = (dx + dy) * (TILE_H / 2);
+                const fwdSLen = Math.hypot(fwdSx, fwdSy) || 1;
+                const rPx = wh.r * CAR_SCALE;
+                // tire semi-axes: along projected forward + screen vertical
+                const whx = (fwdSx / fwdSLen) * rPx,
+                    why = (fwdSy / fwdSLen) * rPx;
+                const wvy = -rPx * 0.95;
+                // half tread width as a screen offset along projected side
+                const twLoc = (wh.r / (TILE_DEPTH * CAR_TALL)) * 0.32;
+                const trdX = (px - py) * (TILE_W / 2) * CAR_SCALE * twLoc,
+                    trdY = (px + py) * (TILE_H / 2) * CAR_SCALE * twLoc;
+                for (const [f, s] of [
+                    [wh.front, wh.side],
+                    [wh.front, -wh.side],
+                    [wh.back, wh.side],
+                    [wh.back, -wh.side],
+                ]) {
+                    faces.push({
+                        wheel: carPt(f, s, axleUp),
+                        sgn: s >= 0 ? 1 : -1,
+                        depth: (dx + dy) * f + (px + py) * s,
+                    });
+
+                }
+                function wheelEllipse(cx2, cy2, k) {
+                    ctx.beginPath();
+                    for (let i = 0; i <= 12; i++) {
+                        const t = (i / 12) * Math.PI * 2;
+                        const co = Math.cos(t),
+                            si = Math.sin(t);
+                        const xx = cx2 + whx * k * co;
+                        const yy = cy2 + why * k * co + wvy * k * si;
+                        if (i) ctx.lineTo(xx, yy);
+                        else ctx.moveTo(xx, yy);
+                    }
+                    ctx.closePath();
+                }
+                // Silhouette of the whole tire: the ellipse swept from the
+                // inner face to the outer face (convex hull of both rims)
+                function wheelHull(cxI, cyI, cxO, cyO, ddx, ddy) {
+                    ctx.beginPath();
+                    for (let i = 0; i <= 24; i++) {
+                        const t = (i / 24) * Math.PI * 2;
+                        const co = Math.cos(t),
+                            si = Math.sin(t);
+                        const ex = whx * co;
+                        const ey = why * co + wvy * si;
+                        const out = ex * ddx + ey * ddy >= 0;
+                        const xx = (out ? cxO : cxI) + ex;
+                        const yy = (out ? cyO : cyI) + ey;
+                        if (i) ctx.lineTo(xx, yy);
+                        else ctx.moveTo(xx, yy);
+                    }
+                    ctx.closePath();
+                }
+
                 faces.sort((a, b) => a.depth - b.depth);
                 ctx.strokeStyle = colors.stroke;
                 ctx.lineWidth = 0.5 * CAR_SCALE;
                 for (const fc of faces) {
+                    if (fc.wheel) {
+                        const ox = trdX * fc.sgn,
+                            oy = trdY * fc.sgn;
+                        const cxO = fc.wheel[0] + ox,
+                            cyO = fc.wheel[1] + oy;
+                        ctx.fillStyle = "#181818";
+                        wheelHull(
+                            fc.wheel[0] - ox,
+                            fc.wheel[1] - oy,
+                            cxO,
+                            cyO,
+                            ox,
+                            oy,
+                        );
+                        ctx.fill();
+                        // hubcap + axle dot, only when the outer face of
+                        // this wheel is turned toward the camera
+                        if (fc.sgn * (px + py) > 0.05) {
+                            ctx.fillStyle = "#2e2e2e";
+                            wheelEllipse(cxO, cyO, 0.96);
+                            ctx.fill();
+                            ctx.fillStyle = "#dcdcdc";
+                            wheelEllipse(cxO, cyO, 0.55);
+                            ctx.fill();
+                            ctx.fillStyle = "#555";
+                            wheelEllipse(cxO, cyO, 0.2);
+                            ctx.fill();
+                        }
+                        continue;
+                    }
                     ctx.beginPath();
                     ctx.moveTo(fc.pts[0][0], fc.pts[0][1]);
                     for (let i = 1; i < fc.pts.length; i++)
@@ -3610,13 +3702,42 @@
                     ctx.stroke();
                 }
 
+                // Race number decal, projected flat onto the hood/roof plane
+                // like the painted numbers on the original sprites.
+                if (mesh.decal && num != null) {
+                    const dc = mesh.decal;
+                    const dh = dc.h + ride;
+                    const o = carPt(dc.f, 0, dh);
+                    const pf = carPt(dc.f + 0.2, 0, dh + 0.2 * dc.slope);
+                    const ps = carPt(dc.f, 0.2, dh);
+                    const k = dc.size / 10; // 10px text -> size units
+                    ctx.save();
+                    ctx.transform(
+                        ((ps[0] - o[0]) / 0.2) * k,
+                        ((ps[1] - o[1]) / 0.2) * k,
+                        (-(pf[0] - o[0]) / 0.2) * k,
+                        (-(pf[1] - o[1]) / 0.2) * k,
+                        o[0],
+                        o[1],
+                    );
+                    ctx.font = "bold 10px monospace";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.lineWidth = 1.6;
+                    ctx.strokeStyle = colors.stroke;
+                    ctx.strokeText(num, 0, 0);
+                    ctx.fillStyle = "#ffffff";
+                    ctx.fillText(num, 0, 0);
+                    ctx.restore();
+                }
+
                 // Decorations on the nose/tail caps, only when that end of
                 // the car points toward the camera.
                 const camDot = (dx + dy) * 0.53;
                 if (camDot > 0.03) {
                     if (mesh.pig) {
                         for (const s of [1, -1]) {
-                            const eye = carPt(0.78, s * 0.18, 0.62);
+                            const eye = carPt(0.78, s * 0.18, 0.62 + ride);
                             ctx.beginPath();
                             ctx.arc(
                                 eye[0],
@@ -3637,7 +3758,11 @@
                             );
                             ctx.fillStyle = "#222";
                             ctx.fill();
-                            const no = carPt(pNose.f + 0.01, s * 0.1, 0.3);
+                            const no = carPt(
+                                pNose.f + 0.01,
+                                s * 0.1,
+                                0.3 + ride,
+                            );
                             ctx.beginPath();
                             ctx.arc(
                                 no[0],
@@ -3654,7 +3779,7 @@
                             const hl = carPt(
                                 pNose.f,
                                 s * pNose.w * 0.55,
-                                pNose.sh * 0.7,
+                                pNose.sh * 0.7 + ride,
                             );
                             ctx.beginPath();
                             ctx.arc(
@@ -3671,7 +3796,11 @@
                 }
                 if (-camDot > 0.03) {
                     if (mesh.pig) {
-                        const tp = carPt(pTail.f - 0.05, 0, pTail.h * 0.75);
+                        const tp = carPt(
+                            pTail.f - 0.05,
+                            0,
+                            pTail.h * 0.75 + ride,
+                        );
                         ctx.beginPath();
                         ctx.arc(
                             tp[0],
@@ -3688,7 +3817,7 @@
                             const tl = carPt(
                                 pTail.f,
                                 s * pTail.w * 0.55,
-                                pTail.sh * 0.8,
+                                pTail.sh * 0.8 + ride,
                             );
                             ctx.beginPath();
                             ctx.arc(
@@ -3714,6 +3843,7 @@
                     car,
                     PLAYER_COLORS,
                     CAR_TYPES[carSelIdx].shape,
+                    CAR_TYPES[carSelIdx].num,
                 );
             }
 
@@ -5736,19 +5866,21 @@
                     obj: ai,
                     colors: ai.colors,
                     shape: ai.shape,
+                    num: ai.num,
                 }));
                 if (inRace) {
                     allCars.push({
                         obj: car,
                         colors: PLAYER_COLORS,
                         shape: CAR_TYPES[carSelIdx].shape,
+                        num: CAR_TYPES[carSelIdx].num,
                     });
                 }
                 allCars.sort(
                     (a, b) => a.obj.col + a.obj.row - (b.obj.col + b.obj.row),
                 );
                 for (const c of allCars)
-                    drawCarGeneric(c.obj, c.colors, c.shape);
+                    drawCarGeneric(c.obj, c.colors, c.shape, c.num);
 
                 drawParticles();
 
@@ -5995,7 +6127,7 @@
                 const px = -dy,
                     py = dx;
                 const f = -0.62 * CAR_SCALE,
-                    s = 0.5 * CAR_SCALE;
+                    s = 0.58 * CAR_SCALE;
                 return [
                     {
                         c: obj.col + dx * f + px * s,
@@ -6395,6 +6527,7 @@
                     },
                     type.colors,
                     type.shape,
+                    type.num,
                 );
                 ctx.restore();
             }
