@@ -1,0 +1,4 @@
+# Super Skidders custom car manifest.
+# One folder name per line; each folder needs car.obj, car.mtl and car.txt.
+# Lines starting with # are comments. See README.txt for the full format.
+example

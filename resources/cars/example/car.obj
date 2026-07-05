@@ -1,0 +1,61 @@
+# Super Skidders example car: a simple wedge body, 16 quads (32 triangles).
+# Nose points toward -Z, +Y is up (Blender's default OBJ export settings).
+# Body only -- the game adds the wheels.
+mtllib car.mtl
+
+# lower body
+v -0.45 0.00  1.00
+v  0.45 0.00  1.00
+v -0.45 0.40  1.00
+v  0.45 0.40  1.00
+v -0.45 0.00 -0.75
+v  0.45 0.00 -0.75
+v -0.40 0.10 -1.00
+v  0.40 0.10 -1.00
+v -0.40 0.28 -1.00
+v  0.40 0.28 -1.00
+v -0.45 0.40 -0.55
+v  0.45 0.40 -0.55
+# cabin
+v -0.45 0.40 -0.35
+v  0.45 0.40 -0.35
+v -0.45 0.40  0.75
+v  0.45 0.40  0.75
+v -0.30 0.70 -0.05
+v  0.30 0.70 -0.05
+v -0.30 0.70  0.60
+v  0.30 0.70  0.60
+
+usemtl body
+# left side
+f 1 3 11 5
+f 5 11 9 7
+# right side
+f 2 4 12 6
+f 6 12 10 8
+# tail
+f 1 2 4 3
+# hood
+f 9 10 12 11
+# front deck (between hood edge and windshield)
+f 11 12 14 13
+# rear deck (behind the cabin)
+f 15 16 4 3
+# underside
+f 5 6 2 1
+f 7 8 6 5
+# roof
+f 17 18 20 19
+
+usemtl glass
+# windshield
+f 13 14 18 17
+# rear window
+f 19 20 16 15
+# side windows
+f 13 17 19 15
+f 14 18 20 16
+
+usemtl bumper
+# nose
+f 7 8 10 9

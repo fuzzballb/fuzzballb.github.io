@@ -1,0 +1,20 @@
+# Super Skidders custom car properties. Lines starting with # are comments.
+
+name: WEDGIE
+desc: The community starter kit
+cylinders: 6        # engine sound: 2, 4, 6 or 8
+
+# Stats (clamped to the ranges shown)
+maxSpeed: 26        # top speed        20 - 29
+accel: 19           # acceleration     13 - 26
+brake: 30           # braking power    20 - 40
+turnSpeed: 2.5      # steering rate    1.8 - 3.2
+grip: 8             # cornering grip   5 - 15
+
+# Visuals (all optional)
+scale: 1.0          # size multiplier on top of auto-normalization
+wheelRadius: 6      # wheel size       3 - 10
+wheelFront: 0.65    # front axle position (0 = center, 1 = nose)
+wheelBack: -0.6     # rear axle position (negative = behind center)
+wheelSide: 0.45     # how far the wheels stick out sideways
+ride: 0.45          # body height above the wheels
