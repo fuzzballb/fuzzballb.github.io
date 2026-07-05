@@ -3,7 +3,7 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>Super Skidders v0.01</title>
+        <title>Super Skidders v0.02</title>
         <style>
             * {
                 margin: 0;
@@ -32,8 +32,6 @@
             const MAP_SIZE = 200;
             const MAX_ELEVATION = 12;
             const WATER_LEVEL = 3;
-            const SCROLL_SPEED = 400;
-            const LERP_FACTOR = 0.15;
 
             // ── Game States ────────────────────────────────────────────────────────
             const STATE = {
@@ -49,11 +47,14 @@
                 CHAMPION: 9,
             };
             let gameState = STATE.LOADING;
-            let raceMode = "quick"; // 'quick' | 'champ'
-            let menuIdx = 0,
-                carSelIdx = 0,
-                trackSelIdx = 0,
-                pauseIdx = 0;
+            let raceMode = "quick"; // 'quick' | 'champ' | 'random' (random picks a track at car-select confirm)
+            // Menu/carousel selection per screen
+            const ui = {
+                menuIdx: 0,
+                carSelIdx: 0,
+                trackSelIdx: 0,
+                pauseIdx: 0,
+            };
             const champ = { raceIdx: 0, points: {}, lastRacePts: {} };
             const CHAMP_POINTS = [10, 6, 3, 1];
 
@@ -70,7 +71,6 @@
                     localStorage.setItem("skidders_" + key, val);
                 } catch (e) {}
             }
-            let soundOn = loadPref("sound", "on") !== "off";
 
             // ── Levels ─────────────────────────────────────────────────────────────
             // Each level is a curated seed + theme. amp/lift reshape the height
@@ -258,6 +258,473 @@
                     },
                 },
             ];
+
+            // ── Custom Cars ────────────────────────────────────────────────────────
+            // User-made cars: a folder under resources/cars/ with car.obj
+            // (low-poly body, no wheels), car.mtl (colors) and car.txt
+            // (stats), listed in resources/cars/cars.txt. See
+            // resources/cars/README.txt. Loaded async at boot; the game
+            // runs fine without them (e.g. when opened via file://).
+            const CUSTOM_TRI_LIMIT = 500;
+
+            function parseCarProps(text, folder) {
+                const raw = {};
+                for (let line of text.split("\n")) {
+                    const hash = line.indexOf("#");
+                    if (hash >= 0) line = line.slice(0, hash);
+                    const colon = line.indexOf(":");
+                    if (colon < 0) continue;
+                    const key = line.slice(0, colon).trim();
+                    if (key) raw[key] = line.slice(colon + 1).trim();
+                }
+                const num = (key, def, lo, hi) => {
+                    const v = parseFloat(raw[key]);
+                    return isFinite(v)
+                        ? Math.max(lo, Math.min(hi, v))
+                        : def;
+                };
+                // Stat ranges keep the car-select bars inside their tracks
+                const stats = {
+                    maxSpeed: num("maxSpeed", 24, 20, 29),
+                    accel: num("accel", 18, 13, 26),
+                    brake: num("brake", 30, 20, 40),
+                    turnSpeed: num("turnSpeed", 2.5, 1.8, 3.2),
+                    grip: num("grip", 9, 5, 15),
+                };
+                // The engine synth only has 2/4/6/8-cylinder firing orders
+                const cyl = num("cylinders", 4, 2, 8);
+                const cylinders = [2, 4, 6, 8].reduce((a, b) =>
+                    Math.abs(b - cyl) < Math.abs(a - cyl) ? b : a,
+                );
+                return {
+                    name: (raw.name || folder).toUpperCase().slice(0, 14),
+                    desc: raw.desc || "Custom machine",
+                    cylinders,
+                    stats,
+                    scale: num("scale", 1, 0.4, 2.5),
+                    wheels: {
+                        r: num("wheelRadius", 6, 3, 10),
+                        front: num("wheelFront", 0.65, 0.2, 1.1),
+                        back: num("wheelBack", -0.6, -1.1, -0.2),
+                        side: num("wheelSide", 0.45, 0.2, 0.8),
+                    },
+                    ride: num("ride", 0.45, 0, 1.2),
+                };
+            }
+
+            // Only newmtl + Kd matter: materials are flat colors, the
+            // renderer's own lighting does the rest.
+            function parseMTL(text) {
+                const mats = new Map();
+                let cur = null;
+                for (const line of text.split("\n")) {
+                    const p = line.trim().split(/\s+/);
+                    if (p[0] === "newmtl") cur = p[1];
+                    else if (p[0] === "Kd" && cur) {
+                        const ch = (v) =>
+                            (
+                                "0" +
+                                Math.round(
+                                    Math.max(
+                                        0,
+                                        Math.min(1, parseFloat(v) || 0),
+                                    ) * 255,
+                                ).toString(16)
+                            ).slice(-2);
+                        mats.set(cur, "#" + ch(p[1]) + ch(p[2]) + ch(p[3]));
+                    }
+                }
+                return mats;
+            }
+
+            // Wavefront OBJ → custom mesh in car-local [fwd, side, up]
+            // space. Blender's default export (Forward -Z, Up +Y) maps as
+            // fwd = -z, side = x, up = y. The body is centered, dropped to
+            // the ground and normalized to 2 local units long so creators
+            // never fight Blender units; `scale:` in car.txt fine-tunes.
+            function parseOBJ(text, mats, props) {
+                const verts = [];
+                const tris = [];
+                let kd = "#888888";
+                for (const line of text.split("\n")) {
+                    const p = line.trim().split(/\s+/);
+                    if (p[0] === "v") {
+                        verts.push([
+                            parseFloat(p[1]),
+                            parseFloat(p[2]),
+                            parseFloat(p[3]),
+                        ]);
+                    } else if (p[0] === "usemtl") {
+                        kd = mats.get(p[1]) || "#888888";
+                    } else if (p[0] === "f") {
+                        const idx = p.slice(1).map((tok) => {
+                            let i = parseInt(tok.split("/")[0], 10);
+                            if (i < 0) i += verts.length + 1;
+                            return i - 1;
+                        });
+                        // fan-triangulate quads / n-gons
+                        for (let i = 2; i < idx.length; i++) {
+                            const tri = [idx[0], idx[i - 1], idx[i]].map(
+                                (j) => verts[j],
+                            );
+                            if (
+                                tri.some(
+                                    (v) =>
+                                        !v || v.some((n) => !isFinite(n)),
+                                )
+                            )
+                                throw new Error(
+                                    "bad face: " + line.trim(),
+                                );
+                            tris.push({ p: tri, kd });
+                        }
+                    }
+                }
+                if (!tris.length) throw new Error("no faces in .obj");
+                if (tris.length > CUSTOM_TRI_LIMIT)
+                    throw new Error(
+                        tris.length +
+                            " triangles (limit " +
+                            CUSTOM_TRI_LIMIT +
+                            ")",
+                    );
+                if (tris.length > 300)
+                    console.warn(
+                        "Custom car has " +
+                            tris.length +
+                            " triangles; consider decimating it.",
+                    );
+                const lo = [Infinity, Infinity, Infinity],
+                    hi = [-Infinity, -Infinity, -Infinity];
+                for (const t of tris)
+                    for (const v of t.p)
+                        for (let a = 0; a < 3; a++) {
+                            if (v[a] < lo[a]) lo[a] = v[a];
+                            if (v[a] > hi[a]) hi[a] = v[a];
+                        }
+                const s =
+                    (2.0 / Math.max(1e-6, hi[2] - lo[2])) * props.scale;
+                const cx = (lo[0] + hi[0]) / 2,
+                    cz = (lo[2] + hi[2]) / 2;
+                for (const t of tris)
+                    t.p = t.p.map((v) => [
+                        -(v[2] - cz) * s,
+                        (v[0] - cx) * s,
+                        (v[1] - lo[1]) * s,
+                    ]);
+                return {
+                    custom: true,
+                    tris,
+                    wheels: props.wheels,
+                    ride: props.ride,
+                    bounds: {
+                        fNose: (cz - lo[2]) * s,
+                        fTail: (cz - hi[2]) * s,
+                        maxW:
+                            Math.max(
+                                Math.abs(lo[0] - cx),
+                                Math.abs(hi[0] - cx),
+                            ) * s,
+                    },
+                };
+            }
+
+            // UI palette (carousel text, stat bars, PLAYER_COLORS) derived
+            // from the model's most-used color; the body itself is painted
+            // per-face from the .mtl.
+            function deriveCarColors(tris) {
+                const count = new Map();
+                for (const t of tris)
+                    count.set(t.kd, (count.get(t.kd) || 0) + 1);
+                let top = "#888888",
+                    best = -1;
+                for (const [c, n] of count)
+                    if (n > best) {
+                        best = n;
+                        top = c;
+                    }
+                const shade = (f) => {
+                    const ch = (i) =>
+                        (
+                            "0" +
+                            Math.min(
+                                255,
+                                Math.round(
+                                    parseInt(top.slice(i, i + 2), 16) * f,
+                                ),
+                            ).toString(16)
+                        ).slice(-2);
+                    return "#" + ch(1) + ch(3) + ch(5);
+                };
+                return {
+                    top,
+                    side: shade(0.85),
+                    dark: shade(0.7),
+                    stroke: shade(0.5),
+                };
+            }
+
+            function buildCustomCar(folder, propsText, objText, mtlText) {
+                const props = parseCarProps(propsText || "", folder);
+                const mats = mtlText ? parseMTL(mtlText) : new Map();
+                const mesh = parseOBJ(objText, mats, props);
+                return {
+                    name: props.name,
+                    desc: props.desc,
+                    custom: true,
+                    shape: mesh,
+                    cylinders: props.cylinders,
+                    colors: deriveCarColors(mesh.tris),
+                    stats: props.stats,
+                };
+            }
+
+            // Replace-by-name so re-adding an edited car updates it in
+            // place; jump the carousel to it when the player is choosing.
+            function addCustomCar(entry) {
+                const i = CAR_TYPES.findIndex(
+                    (c) => c.custom && c.name === entry.name,
+                );
+                const idx = i >= 0 ? i : CAR_TYPES.length;
+                CAR_TYPES[idx] = entry;
+                if (gameState === STATE.CARSEL) ui.carSelIdx = idx;
+                return idx;
+            }
+
+            async function loadCustomCars() {
+                const base = "resources/cars/";
+                try {
+                    const resp = await fetch(base + "cars.txt");
+                    if (!resp.ok) throw new Error("HTTP " + resp.status);
+                    const folders = (await resp.text())
+                        .split("\n")
+                        .map((l) => l.split("#")[0].trim())
+                        .filter(Boolean);
+                    for (const folder of folders) {
+                        try {
+                            const [pResp, oResp] = await Promise.all([
+                                fetch(base + folder + "/car.txt"),
+                                fetch(base + folder + "/car.obj"),
+                            ]);
+                            if (!pResp.ok)
+                                throw new Error("car.txt missing");
+                            if (!oResp.ok)
+                                throw new Error("car.obj missing");
+                            const propsText = await pResp.text();
+                            const objText = await oResp.text();
+                            const mtlName = (objText.match(
+                                /^\s*mtllib\s+(.+)$/m,
+                            ) || [, "car.mtl"])[1].trim();
+                            let mtlText = null;
+                            const mResp = await fetch(
+                                base + folder + "/" + mtlName,
+                            ).catch(() => null);
+                            if (mResp && mResp.ok)
+                                mtlText = await mResp.text();
+                            else
+                                console.warn(
+                                    "Custom car '" +
+                                        folder +
+                                        "': no .mtl, using gray",
+                                );
+                            const entry = buildCustomCar(
+                                folder,
+                                propsText,
+                                objText,
+                                mtlText,
+                            );
+                            addCustomCar(entry);
+                            console.info(
+                                "Loaded custom car:",
+                                entry.name,
+                            );
+                        } catch (e) {
+                            console.warn(
+                                "Skipping custom car '" +
+                                    folder +
+                                    "': " +
+                                    e.message,
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.info(
+                        "No custom cars loaded (" + e.message + ")",
+                    );
+                }
+            }
+
+            // Drag & drop: works even when the game is opened straight
+            // from disk (file://), where fetch() is blocked and the
+            // manifest loader above can't run. Drop a car folder (or its
+            // car.obj / car.mtl / car.txt) anywhere on the page; the car
+            // is added to the carousel and remembered in localStorage.
+            let dropNotice = null;
+            function noticeDrop(text, color) {
+                dropNotice = {
+                    text,
+                    color,
+                    until: performance.now() + 4000,
+                };
+            }
+
+            function storeCustomCar(folder, props, obj, mtl) {
+                try {
+                    const all = JSON.parse(loadPref("customcars", "[]"));
+                    const i = all.findIndex((c) => c.folder === folder);
+                    const rec = { folder, props, obj, mtl };
+                    if (i >= 0) all[i] = rec;
+                    else all.push(rec);
+                    savePref("customcars", JSON.stringify(all));
+                } catch (e) {
+                    console.warn(
+                        "Could not store custom car:",
+                        e.message,
+                    );
+                }
+            }
+
+            function restoreStoredCars() {
+                let all = [];
+                try {
+                    all = JSON.parse(loadPref("customcars", "[]"));
+                } catch (e) {}
+                for (const rec of all) {
+                    try {
+                        addCustomCar(
+                            buildCustomCar(
+                                rec.folder,
+                                rec.props,
+                                rec.obj,
+                                rec.mtl,
+                            ),
+                        );
+                        console.info(
+                            "Restored custom car:",
+                            rec.folder,
+                        );
+                    } catch (e) {
+                        console.warn(
+                            "Skipping stored custom car '" +
+                                rec.folder +
+                                "': " +
+                                e.message,
+                        );
+                    }
+                }
+            }
+
+            window.addEventListener("dragover", (e) =>
+                e.preventDefault(),
+            );
+            window.addEventListener("drop", (e) => {
+                e.preventDefault();
+                // Snapshot everything synchronously: the DataTransfer is
+                // neutered the moment this handler returns, so entries
+                // grabbed after an `await` come back null.
+                const loose = [...e.dataTransfer.files];
+                const entries = [...e.dataTransfer.items]
+                    .map((it) =>
+                        it.webkitGetAsEntry ? it.webkitGetAsEntry() : null,
+                    )
+                    .filter(Boolean);
+                const files = [];
+                let folderName = null;
+                let sawDirectory = false;
+                const walk = (entry, depth) =>
+                    new Promise((res) => {
+                        if (entry.isFile)
+                            entry.file((f) => {
+                                files.push(f);
+                                res();
+                            }, () => res());
+                        else if (entry.isDirectory && depth < 3) {
+                            sawDirectory = true;
+                            if (!folderName) folderName = entry.name;
+                            const rd = entry.createReader();
+                            // readEntries returns batches; keep calling
+                            // until it comes back empty
+                            const next = () =>
+                                rd.readEntries(async (ents) => {
+                                    if (!ents.length) return res();
+                                    for (const en of ents)
+                                        await walk(en, depth + 1);
+                                    next();
+                                }, () => res());
+                            next();
+                        } else res();
+                    });
+                (async () => {
+                    for (const en of entries) await walk(en, 0);
+                    // On file:// pages Chrome's FileSystemEntry API fails
+                    // (EncodingError), but the plain File objects still
+                    // read fine — fall back to those.
+                    if (!files.length) files.push(...loose);
+                    // Prefer the canonical names so a folder that also
+                    // holds a README or other strays still works.
+                    const pick = (ext, preferred) =>
+                        files.find(
+                            (f) => f.name.toLowerCase() === preferred,
+                        ) ||
+                        files.find(
+                            (f) =>
+                                f.name.toLowerCase().endsWith(ext) &&
+                                !/readme/i.test(f.name),
+                        );
+                    try {
+                        const obj = pick(".obj", "car.obj");
+                        if (!obj)
+                            throw new Error(
+                                sawDirectory
+                                    ? "can't read folders here - open it and drop the 3 files"
+                                    : "no .obj file in the drop",
+                            );
+                        const mtl = pick(".mtl", "car.mtl");
+                        const txt = pick(".txt", "car.txt");
+                        const folder =
+                            folderName ||
+                            obj.name.replace(/\.obj$/i, "");
+                        const objText = await obj.text();
+                        const mtlText = mtl ? await mtl.text() : null;
+                        const propsText = txt ? await txt.text() : "";
+                        if (!mtlText)
+                            console.warn(
+                                "Dropped car: no .mtl, using gray",
+                            );
+                        const entry = buildCustomCar(
+                            folder,
+                            propsText,
+                            objText,
+                            mtlText,
+                        );
+                        addCustomCar(entry);
+                        storeCustomCar(
+                            folder,
+                            propsText,
+                            objText,
+                            mtlText,
+                        );
+                        noticeDrop(
+                            "ADDED " + entry.name + " TO THE GARAGE",
+                            "#40e080",
+                        );
+                        console.info(
+                            "Loaded dropped custom car:",
+                            entry.name,
+                        );
+                    } catch (err) {
+                        noticeDrop(
+                            "COULDN'T LOAD CAR: " +
+                                err.message.toUpperCase(),
+                            "#ff5050",
+                        );
+                        console.warn(
+                            "Dropped car failed:",
+                            err.message,
+                        );
+                    }
+                })();
+            });
 
             // ── AI Driver Pool ─────────────────────────────────────────────────────
             const AI_POOL = [
@@ -547,6 +1014,27 @@
                     trackMap[r] = new Uint8Array(MAP_SIZE);
                 }
 
+                const waypoints = makeTrackWaypoints();
+                trackWaypoints = waypoints;
+
+                const splinePoints = buildSplinePath(waypoints);
+                racePath = splinePoints.slice(); // save for AI
+
+                const trackWidth = currentLevel.trackWidth || 7; // half-width in tiles
+                const { tileSplineIdx, tileCrossDist } = paintTrackSurface(
+                    splinePoints,
+                    trackWidth,
+                );
+
+                placeCheckpoints(splinePoints, waypoints);
+                fillTrackHoles();
+                raiseTrackAboveWater();
+                flattenUnderTrack();
+                computeBanking(splinePoints, tileSplineIdx, tileCrossDist, trackWidth);
+                addCrossingRamps(splinePoints, tileSplineIdx, tileCrossDist, trackWidth);
+            }
+
+            function makeTrackWaypoints() {
                 // Generate random waypoints using a proper seeded PRNG
                 const cx = MAP_SIZE / 2,
                     cy = MAP_SIZE / 2;
@@ -625,9 +1113,10 @@
                         ]);
                     }
                 }
+                return waypoints;
+            }
 
-                trackWaypoints = waypoints;
-
+            function buildSplinePath(waypoints) {
                 // Interpolate smooth path using Catmull-Rom spline
                 const splinePoints = [];
                 const numSegPoints = 40; // points per segment
@@ -660,11 +1149,11 @@
                         splinePoints.push([x, y]);
                     }
                 }
+                return splinePoints;
+            }
 
-                racePath = splinePoints.slice(); // save for AI
-
+            function paintTrackSurface(splinePoints, trackWidth) {
                 // Paint track tiles with width, storing spline ownership for banking
-                const trackWidth = currentLevel.trackWidth || 7; // half-width in tiles
                 const tileSplineIdx = []; // which spline point "owns" each tile
                 const tileCrossDist = []; // signed cross-track distance
                 for (let r = 0; r < MAP_SIZE; r++) {
@@ -773,7 +1262,10 @@
                         }
                     }
                 }
+                return { tileSplineIdx, tileCrossDist };
+            }
 
+            function placeCheckpoints(splinePoints, waypoints) {
                 // Generate evenly-spaced checkpoints along the spline by arc length
                 checkpoints = [];
                 const totalSpline = splinePoints.length;
@@ -899,7 +1391,9 @@
                     });
                 }
                 race.totalCheckpoints = checkpoints.length;
+            }
 
+            function fillTrackHoles() {
                 // Fill any holes in the track (non-track tiles surrounded by track on all 4 cardinal sides)
                 for (let r = 1; r < MAP_SIZE - 1; r++) {
                     for (let c = 1; c < MAP_SIZE - 1; c++) {
@@ -914,7 +1408,9 @@
                         }
                     }
                 }
+            }
 
+            function raiseTrackAboveWater() {
                 // Raise terrain near the track above water level so water doesn't appear adjacent
                 // BFS flood from track tiles to find all tiles within buffer distance
                 const waterBuffer = 15;
@@ -972,7 +1468,9 @@
                         }
                     }
                 }
+            }
 
+            function flattenUnderTrack() {
                 // Flatten terrain under the track for smoother racing surface (after water removal)
                 for (let r = 0; r < MAP_SIZE; r++) {
                     for (let c = 0; c < MAP_SIZE; c++) {
@@ -1002,7 +1500,9 @@
                         }
                     }
                 }
+            }
 
+            function computeBanking(splinePoints, tileSplineIdx, tileCrossDist, trackWidth) {
                 // Compute curvature at each spline point and build a banking map
                 trackBanking = [];
                 rampLaunch = [];
@@ -1107,7 +1607,10 @@
                 trackBanking = bankSmooth;
 
                 // Banking for non-track tiles is already handled by extended spline ownership + fade
+            }
 
+            function addCrossingRamps(splinePoints, tileSplineIdx, tileCrossDist, trackWidth) {
+                const totalSP = splinePoints.length;
                 // Detect track self-intersection (figure-8 crossings) and add
                 // a jump ramp on the approach to each pass over the crossing,
                 // so cars launch over the other path.
@@ -1458,244 +1961,255 @@
                 const s = item.size;
                 const c = item.cols;
 
-                if (item.type === "rock") {
-                    // Simple isometric rock: a low irregular box
-                    const h = s * 0.6;
-                    const w = s * 0.5;
-                    const base = toScreen(item.col, item.row, e);
-                    const top = toScreen(item.col, item.row, e + h);
-                    const bl = toScreen(item.col - w, item.row + w, e);
-                    const br = toScreen(item.col + w, item.row + w, e);
-                    const tl = toScreen(
-                        item.col - w,
-                        item.row + w,
-                        e + h * 0.7,
-                    );
-                    const tr = toScreen(
-                        item.col + w,
-                        item.row + w,
-                        e + h * 0.7,
-                    );
-                    // Right face
-                    ctx.beginPath();
-                    ctx.moveTo(base[0], base[1]);
-                    ctx.lineTo(br[0], br[1]);
-                    ctx.lineTo(tr[0], tr[1]);
-                    ctx.lineTo(top[0], top[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.side, 1);
-                    ctx.fill();
-                    // Left face
-                    ctx.beginPath();
-                    ctx.moveTo(base[0], base[1]);
-                    ctx.lineTo(bl[0], bl[1]);
-                    ctx.lineTo(tl[0], tl[1]);
-                    ctx.lineTo(top[0], top[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.dark, 1);
-                    ctx.fill();
-                    // Top face
-                    ctx.beginPath();
-                    ctx.moveTo(top[0], top[1]);
-                    ctx.lineTo(tr[0], tr[1]);
-                    const tbr = toScreen(
-                        item.col,
-                        item.row + w * 1.2,
-                        e + h * 0.5,
-                    );
-                    ctx.lineTo(tbr[0], tbr[1]);
-                    ctx.lineTo(tl[0], tl[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.top, 1);
-                    ctx.fill();
-                } else if (item.type === "bush") {
-                    // Round bush: diamond top + 2 side faces
-                    const h = s * 0.8;
-                    const w = s * 0.5;
-                    const center = toScreen(item.col, item.row, e + h);
-                    const right = toScreen(item.col + w, item.row, e + h * 0.3);
-                    const left = toScreen(item.col, item.row + w, e + h * 0.3);
-                    const bottom = toScreen(item.col, item.row, e);
-                    const back = toScreen(
-                        item.col - w * 0.3,
-                        item.row - w * 0.3,
-                        e + h * 0.5,
-                    );
-                    // Right side
-                    ctx.beginPath();
-                    ctx.moveTo(bottom[0], bottom[1]);
-                    ctx.lineTo(right[0], right[1]);
-                    ctx.lineTo(center[0], center[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.side, 1);
-                    ctx.fill();
-                    // Left side
-                    ctx.beginPath();
-                    ctx.moveTo(bottom[0], bottom[1]);
-                    ctx.lineTo(left[0], left[1]);
-                    ctx.lineTo(center[0], center[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.dark, 1);
-                    ctx.fill();
-                    // Top
-                    ctx.beginPath();
-                    ctx.moveTo(center[0], center[1]);
-                    ctx.lineTo(right[0], right[1]);
-                    ctx.lineTo(back[0], back[1]);
-                    ctx.lineTo(left[0], left[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.top, 1);
-                    ctx.fill();
-                } else if (item.type === "tree") {
-                    // Tree: trunk (thin box) + foliage (diamond/pyramid)
-                    const trunkH = s * 0.8;
-                    const trunkW = s * 0.12;
-                    const foliageH = s * 1.2;
-                    const foliageW = s * 0.6;
+                if (item.type === "rock") drawSceneryRock(item, e, s, c);
+                else if (item.type === "bush") drawSceneryBush(item, e, s, c);
+                else if (item.type === "tree") drawSceneryTree(item, e, s, c);
+                else if (item.type === "spectators") drawScenerySpectators(item, c);
+            }
 
-                    // Trunk - just 2 visible faces
-                    const tb = toScreen(item.col, item.row, e);
-                    const tt = toScreen(item.col, item.row, e + trunkH);
-                    const tbr = toScreen(item.col + trunkW, item.row, e);
-                    const ttr = toScreen(
-                        item.col + trunkW,
-                        item.row,
-                        e + trunkH,
+            function drawSceneryRock(item, e, s, c) {
+                // Simple isometric rock: a low irregular box
+                const h = s * 0.6;
+                const w = s * 0.5;
+                const base = toScreen(item.col, item.row, e);
+                const top = toScreen(item.col, item.row, e + h);
+                const bl = toScreen(item.col - w, item.row + w, e);
+                const br = toScreen(item.col + w, item.row + w, e);
+                const tl = toScreen(
+                    item.col - w,
+                    item.row + w,
+                    e + h * 0.7,
+                );
+                const tr = toScreen(
+                    item.col + w,
+                    item.row + w,
+                    e + h * 0.7,
+                );
+                // Right face
+                ctx.beginPath();
+                ctx.moveTo(base[0], base[1]);
+                ctx.lineTo(br[0], br[1]);
+                ctx.lineTo(tr[0], tr[1]);
+                ctx.lineTo(top[0], top[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.side, 1);
+                ctx.fill();
+                // Left face
+                ctx.beginPath();
+                ctx.moveTo(base[0], base[1]);
+                ctx.lineTo(bl[0], bl[1]);
+                ctx.lineTo(tl[0], tl[1]);
+                ctx.lineTo(top[0], top[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.dark, 1);
+                ctx.fill();
+                // Top face
+                ctx.beginPath();
+                ctx.moveTo(top[0], top[1]);
+                ctx.lineTo(tr[0], tr[1]);
+                const tbr = toScreen(
+                    item.col,
+                    item.row + w * 1.2,
+                    e + h * 0.5,
+                );
+                ctx.lineTo(tbr[0], tbr[1]);
+                ctx.lineTo(tl[0], tl[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.top, 1);
+                ctx.fill();
+            }
+
+            function drawSceneryBush(item, e, s, c) {
+                // Round bush: diamond top + 2 side faces
+                const h = s * 0.8;
+                const w = s * 0.5;
+                const center = toScreen(item.col, item.row, e + h);
+                const right = toScreen(item.col + w, item.row, e + h * 0.3);
+                const left = toScreen(item.col, item.row + w, e + h * 0.3);
+                const bottom = toScreen(item.col, item.row, e);
+                const back = toScreen(
+                    item.col - w * 0.3,
+                    item.row - w * 0.3,
+                    e + h * 0.5,
+                );
+                // Right side
+                ctx.beginPath();
+                ctx.moveTo(bottom[0], bottom[1]);
+                ctx.lineTo(right[0], right[1]);
+                ctx.lineTo(center[0], center[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.side, 1);
+                ctx.fill();
+                // Left side
+                ctx.beginPath();
+                ctx.moveTo(bottom[0], bottom[1]);
+                ctx.lineTo(left[0], left[1]);
+                ctx.lineTo(center[0], center[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.dark, 1);
+                ctx.fill();
+                // Top
+                ctx.beginPath();
+                ctx.moveTo(center[0], center[1]);
+                ctx.lineTo(right[0], right[1]);
+                ctx.lineTo(back[0], back[1]);
+                ctx.lineTo(left[0], left[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.top, 1);
+                ctx.fill();
+            }
+
+            function drawSceneryTree(item, e, s, c) {
+                // Tree: trunk (thin box) + foliage (diamond/pyramid)
+                const trunkH = s * 0.8;
+                const trunkW = s * 0.12;
+                const foliageH = s * 1.2;
+                const foliageW = s * 0.6;
+
+                // Trunk - just 2 visible faces
+                const tb = toScreen(item.col, item.row, e);
+                const tt = toScreen(item.col, item.row, e + trunkH);
+                const tbr = toScreen(item.col + trunkW, item.row, e);
+                const ttr = toScreen(
+                    item.col + trunkW,
+                    item.row,
+                    e + trunkH,
+                );
+                const tbl = toScreen(item.col, item.row + trunkW, e);
+                const ttl = toScreen(
+                    item.col,
+                    item.row + trunkW,
+                    e + trunkH,
+                );
+                ctx.beginPath();
+                ctx.moveTo(tb[0], tb[1]);
+                ctx.lineTo(tbr[0], tbr[1]);
+                ctx.lineTo(ttr[0], ttr[1]);
+                ctx.lineTo(tt[0], tt[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.trunk, 0.9);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(tb[0], tb[1]);
+                ctx.lineTo(tbl[0], tbl[1]);
+                ctx.lineTo(ttl[0], ttl[1]);
+                ctx.lineTo(tt[0], tt[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.trunk, 0.7);
+                ctx.fill();
+
+                // Foliage - diamond pyramid
+                const fBase = e + trunkH * 0.6;
+                const fTop = toScreen(item.col, item.row, fBase + foliageH);
+                const fR = toScreen(item.col + foliageW, item.row, fBase);
+                const fL = toScreen(item.col, item.row + foliageW, fBase);
+                const fFront = toScreen(
+                    item.col + foliageW * 0.5,
+                    item.row + foliageW * 0.5,
+                    fBase,
+                );
+                const fBack = toScreen(
+                    item.col - foliageW * 0.5,
+                    item.row - foliageW * 0.5,
+                    fBase,
+                );
+                // Right face
+                ctx.beginPath();
+                ctx.moveTo(fTop[0], fTop[1]);
+                ctx.lineTo(fR[0], fR[1]);
+                ctx.lineTo(fFront[0], fFront[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.side, 1);
+                ctx.fill();
+                // Left face
+                ctx.beginPath();
+                ctx.moveTo(fTop[0], fTop[1]);
+                ctx.lineTo(fL[0], fL[1]);
+                ctx.lineTo(fFront[0], fFront[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.dark, 1);
+                ctx.fill();
+                // Back-right
+                ctx.beginPath();
+                ctx.moveTo(fTop[0], fTop[1]);
+                ctx.lineTo(fR[0], fR[1]);
+                ctx.lineTo(fBack[0], fBack[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.top, 0.85);
+                ctx.fill();
+                // Back-left
+                ctx.beginPath();
+                ctx.moveTo(fTop[0], fTop[1]);
+                ctx.lineTo(fL[0], fL[1]);
+                ctx.lineTo(fBack[0], fBack[1]);
+                ctx.closePath();
+                ctx.fillStyle = rgb(c.top, 1);
+                ctx.fill();
+            }
+
+            function drawScenerySpectators(item, c) {
+                // Group of small people standing near the track
+                const people = c.people;
+                for (const p of people) {
+                    const px = item.col + p.ox;
+                    const py = item.row + p.oy;
+                    const pe = getTerrainHeight(px, py);
+                    const bodyH = p.height;
+                    const bodyW = 0.25;
+                    const headR = 0.18;
+
+                    // Body (shirt color) - simple rectangle
+                    const bBot = toScreen(px, py, pe);
+                    const bTop = toScreen(px, py, pe + bodyH * 0.65);
+                    const bBotR = toScreen(px + bodyW, py, pe);
+                    const bTopR = toScreen(
+                        px + bodyW,
+                        py,
+                        pe + bodyH * 0.65,
                     );
-                    const tbl = toScreen(item.col, item.row + trunkW, e);
-                    const ttl = toScreen(
-                        item.col,
-                        item.row + trunkW,
-                        e + trunkH,
+
+                    // Pants (dark)
+                    const pTop = toScreen(px, py, pe + bodyH * 0.3);
+                    const pTopR = toScreen(
+                        px + bodyW,
+                        py,
+                        pe + bodyH * 0.3,
                     );
                     ctx.beginPath();
-                    ctx.moveTo(tb[0], tb[1]);
-                    ctx.lineTo(tbr[0], tbr[1]);
-                    ctx.lineTo(ttr[0], ttr[1]);
-                    ctx.lineTo(tt[0], tt[1]);
+                    ctx.moveTo(bBot[0], bBot[1]);
+                    ctx.lineTo(bBotR[0], bBotR[1]);
+                    ctx.lineTo(pTopR[0], pTopR[1]);
+                    ctx.lineTo(pTop[0], pTop[1]);
                     ctx.closePath();
-                    ctx.fillStyle = rgb(c.trunk, 0.9);
-                    ctx.fill();
-                    ctx.beginPath();
-                    ctx.moveTo(tb[0], tb[1]);
-                    ctx.lineTo(tbl[0], tbl[1]);
-                    ctx.lineTo(ttl[0], ttl[1]);
-                    ctx.lineTo(tt[0], tt[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.trunk, 0.7);
+                    ctx.fillStyle = "rgb(40,40,60)";
                     ctx.fill();
 
-                    // Foliage - diamond pyramid
-                    const fBase = e + trunkH * 0.6;
-                    const fTop = toScreen(item.col, item.row, fBase + foliageH);
-                    const fR = toScreen(item.col + foliageW, item.row, fBase);
-                    const fL = toScreen(item.col, item.row + foliageW, fBase);
-                    const fFront = toScreen(
-                        item.col + foliageW * 0.5,
-                        item.row + foliageW * 0.5,
-                        fBase,
+                    // Shirt
+                    ctx.beginPath();
+                    ctx.moveTo(pTop[0], pTop[1]);
+                    ctx.lineTo(pTopR[0], pTopR[1]);
+                    ctx.lineTo(bTopR[0], bTopR[1]);
+                    ctx.lineTo(bTop[0], bTop[1]);
+                    ctx.closePath();
+                    ctx.fillStyle = rgb(p.shirt, 1);
+                    ctx.fill();
+
+                    // Head (circle)
+                    const head = toScreen(
+                        px + bodyW * 0.5,
+                        py,
+                        pe + bodyH * 0.8,
                     );
-                    const fBack = toScreen(
-                        item.col - foliageW * 0.5,
-                        item.row - foliageW * 0.5,
-                        fBase,
+                    ctx.beginPath();
+                    ctx.arc(
+                        head[0],
+                        head[1],
+                        Math.max(3, headR * TILE_W * 0.7),
+                        0,
+                        Math.PI * 2,
                     );
-                    // Right face
-                    ctx.beginPath();
-                    ctx.moveTo(fTop[0], fTop[1]);
-                    ctx.lineTo(fR[0], fR[1]);
-                    ctx.lineTo(fFront[0], fFront[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.side, 1);
+                    ctx.fillStyle = rgb(p.skin, 1);
                     ctx.fill();
-                    // Left face
-                    ctx.beginPath();
-                    ctx.moveTo(fTop[0], fTop[1]);
-                    ctx.lineTo(fL[0], fL[1]);
-                    ctx.lineTo(fFront[0], fFront[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.dark, 1);
-                    ctx.fill();
-                    // Back-right
-                    ctx.beginPath();
-                    ctx.moveTo(fTop[0], fTop[1]);
-                    ctx.lineTo(fR[0], fR[1]);
-                    ctx.lineTo(fBack[0], fBack[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.top, 0.85);
-                    ctx.fill();
-                    // Back-left
-                    ctx.beginPath();
-                    ctx.moveTo(fTop[0], fTop[1]);
-                    ctx.lineTo(fL[0], fL[1]);
-                    ctx.lineTo(fBack[0], fBack[1]);
-                    ctx.closePath();
-                    ctx.fillStyle = rgb(c.top, 1);
-                    ctx.fill();
-                } else if (item.type === "spectators") {
-                    // Group of small people standing near the track
-                    const people = c.people;
-                    for (const p of people) {
-                        const px = item.col + p.ox;
-                        const py = item.row + p.oy;
-                        const pe = getTerrainHeight(px, py);
-                        const bodyH = p.height;
-                        const bodyW = 0.25;
-                        const headR = 0.18;
-
-                        // Body (shirt color) - simple rectangle
-                        const bBot = toScreen(px, py, pe);
-                        const bTop = toScreen(px, py, pe + bodyH * 0.65);
-                        const bBotR = toScreen(px + bodyW, py, pe);
-                        const bTopR = toScreen(
-                            px + bodyW,
-                            py,
-                            pe + bodyH * 0.65,
-                        );
-
-                        // Pants (dark)
-                        const pTop = toScreen(px, py, pe + bodyH * 0.3);
-                        const pTopR = toScreen(
-                            px + bodyW,
-                            py,
-                            pe + bodyH * 0.3,
-                        );
-                        ctx.beginPath();
-                        ctx.moveTo(bBot[0], bBot[1]);
-                        ctx.lineTo(bBotR[0], bBotR[1]);
-                        ctx.lineTo(pTopR[0], pTopR[1]);
-                        ctx.lineTo(pTop[0], pTop[1]);
-                        ctx.closePath();
-                        ctx.fillStyle = "rgb(40,40,60)";
-                        ctx.fill();
-
-                        // Shirt
-                        ctx.beginPath();
-                        ctx.moveTo(pTop[0], pTop[1]);
-                        ctx.lineTo(pTopR[0], pTopR[1]);
-                        ctx.lineTo(bTopR[0], bTopR[1]);
-                        ctx.lineTo(bTop[0], bTop[1]);
-                        ctx.closePath();
-                        ctx.fillStyle = rgb(p.shirt, 1);
-                        ctx.fill();
-
-                        // Head (circle)
-                        const head = toScreen(
-                            px + bodyW * 0.5,
-                            py,
-                            pe + bodyH * 0.8,
-                        );
-                        ctx.beginPath();
-                        ctx.arc(
-                            head[0],
-                            head[1],
-                            Math.max(3, headR * TILE_W * 0.7),
-                            0,
-                            Math.PI * 2,
-                        );
-                        ctx.fillStyle = rgb(p.skin, 1);
-                        ctx.fill();
-                    }
                 }
             }
 
@@ -1712,24 +2226,6 @@
 
             // ── Camera ─────────────────────────────────────────────────────────────
             const camera = { x: 0, y: 0, targetX: 0, targetY: 0 };
-
-            function centerCamera() {
-                const midCol = MAP_SIZE / 2,
-                    midRow = MAP_SIZE / 2;
-                const sx = (midCol - midRow) * (TILE_W / 2);
-                const sy = (midCol + midRow) * (TILE_H / 2);
-                camera.x = camera.targetX = sx - canvas.width / 2;
-                camera.y = camera.targetY =
-                    sy - canvas.height / 2 - (MAX_ELEVATION * TILE_DEPTH) / 2;
-            }
-
-            // ── Coordinate Transforms ──────────────────────────────────────────────
-            function worldToScreen(col, row, elev) {
-                return [
-                    (col - row) * (TILE_W / 2) - camera.x,
-                    (col + row) * (TILE_H / 2) - elev * TILE_DEPTH - camera.y,
-                ];
-            }
 
             // ── Tile Drawing ───────────────────────────────────────────────────────
             function drawTile(col, row) {
@@ -1755,31 +2251,7 @@
                     eLeft = Math.max(eLeft, WATER_LEVEL);
                 }
 
-                const avgElev = (eTop + eRight + eBottom + eLeft) / 4;
-                const elevBright = 0.6 + 0.4 * (avgElev / MAX_ELEVATION);
-
-                // Slope-based shading: compute surface normal from corner elevations
-                // Gradient in col direction (right - left) and row direction (bottom - top)
-                const dCol = (eRight + eBottom - (eTop + eLeft)) / 2;
-                const dRow = (eLeft + eBottom - (eTop + eRight)) / 2;
-                // Light direction: from upper-right (-1, -1, 1) normalized
-                // Normal is (-dCol, -dRow, 1), dot with light
-                const nx = -dCol,
-                    ny = -dRow,
-                    nz = 1;
-                const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
-                const lx = -0.6,
-                    ly = -0.8,
-                    lz = 0.7;
-                const lLen = Math.sqrt(lx * lx + ly * ly + lz * lz);
-                const dot = (nx * lx + ny * ly + nz * lz) / (nLen * lLen);
-                // Map dot product to brightness modifier: -1..1 → 0.65..1.15
-                const slopeBright = 0.9 + dot * 0.25;
-
-                const bright = Math.max(
-                    0.3,
-                    Math.min(1.2, elevBright * slopeBright),
-                );
+                const bright = computeTileShade(eTop, eRight, eBottom, eLeft);
 
                 // Base screen position at elevation 0
                 const bx = (col - row) * (TILE_W / 2) - camera.x;
@@ -1808,14 +2280,77 @@
                     bottomY = by + TILE_H / 2 - eBottom * TILE_DEPTH;
                 const leftX = bx - TILE_W / 2,
                     leftY = by - eLeft * TILE_DEPTH;
+                const corners = {
+                    topX,
+                    topY,
+                    rightX,
+                    rightY,
+                    bottomX,
+                    bottomY,
+                    leftX,
+                    leftY,
+                };
 
                 // Determine tile surface type
                 const track = trackMap[row][col];
+                const { topColor, rightColor, leftColor } = computeTileColors(
+                    track,
+                    biome,
+                    col,
+                    row,
+                );
+                const { trackSide, altTopColor } = computeTileSplit(
+                    col,
+                    row,
+                    track,
+                    biome,
+                    rawH,
+                );
+
+                fillTileTop(corners, topColor, altTopColor, trackSide, bright);
+                drawTileSides(
+                    corners,
+                    by,
+                    eRight,
+                    eBottom,
+                    eLeft,
+                    rightColor,
+                    leftColor,
+                    bright,
+                );
+            }
+
+            function computeTileShade(eTop, eRight, eBottom, eLeft) {
+                const avgElev = (eTop + eRight + eBottom + eLeft) / 4;
+                const elevBright = 0.6 + 0.4 * (avgElev / MAX_ELEVATION);
+
+                // Slope-based shading: compute surface normal from corner elevations
+                // Gradient in col direction (right - left) and row direction (bottom - top)
+                const dCol = (eRight + eBottom - (eTop + eLeft)) / 2;
+                const dRow = (eLeft + eBottom - (eTop + eRight)) / 2;
+                // Light direction: from upper-right (-1, -1, 1) normalized
+                // Normal is (-dCol, -dRow, 1), dot with light
+                const nx = -dCol,
+                    ny = -dRow,
+                    nz = 1;
+                const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+                const lx = -0.6,
+                    ly = -0.8,
+                    lz = 0.7;
+                const lLen = Math.sqrt(lx * lx + ly * ly + lz * lz);
+                const dot = (nx * lx + ny * ly + nz * lz) / (nLen * lLen);
+                // Map dot product to brightness modifier: -1..1 → 0.65..1.15
+                const slopeBright = 0.9 + dot * 0.25;
+
+                const bright = Math.max(
+                    0.3,
+                    Math.min(1.2, elevBright * slopeBright),
+                );
+                return bright;
+            }
+
+            function computeTileColors(track, biome, col, row) {
                 let topColor, rightColor, leftColor;
-                let altTopColor = null; // second color for split tiles
-
-                const isTrack = track === 1 || track === 2;
-
                 if (track === 1) {
                     topColor = [55, 55, 60];
                     rightColor = [40, 40, 44];
@@ -1830,13 +2365,16 @@
                     rightColor = biome.right;
                     leftColor = biome.left;
                 }
+                return { topColor, rightColor, leftColor };
+            }
 
+            function computeTileSplit(col, row, track, biome, rawH) {
+                const isTrack = track === 1 || track === 2;
+                let altTopColor = null; // second color for split tiles
                 // Smooth track edges: for terrain tiles bordering the track, split the diamond
                 // so the track-adjacent portion is filled with asphalt color.
                 // Diamond corners: 0=top, 1=right, 2=bottom, 3=left (clockwise)
                 // Each corner's neighbor: top→(row-1,col), right→(row,col+1), bottom→(row+1,col), left→(row-1,col)
-                const cornerX = [topX, rightX, bottomX, leftX];
-                const cornerY = [topY, rightY, bottomY, leftY];
                 let trackSide = null; // boolean per corner: true if that neighbor is track
 
                 if (
@@ -2001,7 +2539,12 @@
                         }
                     }
                 }
+                return { trackSide, altTopColor };
+            }
 
+            function fillTileTop(corners, topColor, altTopColor, trackSide, bright) {
+                const { topX, topY, rightX, rightY, bottomX, bottomY, leftX, leftY } =
+                    corners;
                 if (!trackSide) {
                     // Normal single-color tile
                     ctx.beginPath();
@@ -2077,7 +2620,10 @@
                         ctx.fill();
                     }
                 }
+            }
 
+            function drawTileSides(corners, by, eRight, eBottom, eLeft, rightColor, leftColor, bright) {
+                const { rightX, rightY, bottomX, bottomY, leftX, leftY } = corners;
                 // Right side face (right → bottom edge, extending down to ground)
                 const rightSideH = Math.max(eRight, eBottom) * TILE_DEPTH;
 
@@ -2147,7 +2693,7 @@
                 car.turnSpeed = t.stats.turnSpeed;
                 car.grip = t.stats.grip;
                 PLAYER_COLORS = t.colors;
-                if (engineNodes) swapPlayerEngine(t.cylinders);
+                if (audio.engineNodes) swapPlayerEngine(t.cylinders);
             }
 
             function getTerrainHeight(c, r) {
@@ -2230,7 +2776,7 @@
                 car.prevSlope = 0;
                 car.airborne = false;
                 car.jumpBaseH = 0;
-                applyCarStats(carSelIdx);
+                applyCarStats(ui.carSelIdx);
             }
 
             function updateCar(dt) {
@@ -2238,6 +2784,39 @@
                 car.prevRow = car.row;
                 pollGamepad();
 
+                applyCarSteering(dt);
+                applyCarThrottle(dt);
+
+                // Off-track penalty: heavy friction when not on the track
+                const tileCol = Math.round(car.col),
+                    tileRow = Math.round(car.row);
+                const onTrack =
+                    tileCol >= 0 &&
+                    tileCol < MAP_SIZE &&
+                    tileRow >= 0 &&
+                    tileRow < MAP_SIZE &&
+                    trackMap[tileRow][tileCol] > 0;
+                if (!onTrack && car.airHeight <= 0) {
+                    car.speed *= 1 - _tuneBounce.offDrag * dt; // drag off-track
+                    car.speed = Math.max(
+                        -car.maxSpeed * 0.15,
+                        Math.min(car.maxSpeed * 0.3, car.speed),
+                    );
+                }
+
+                applySlopeResistance(dt);
+                applyPowerslide(dt, onTrack);
+                enforceTrackBoundary(dt);
+                updateCarJump(dt, onTrack);
+
+                // Skid marks while sliding on the ground
+                updateSkidMarks(car, car.slip > 3.2 && car.airHeight <= 0);
+
+                // Checkpoint crossing detection
+                updateCheckpoints();
+            }
+
+            function applyCarSteering(dt) {
                 const airFactor = car.airHeight > 0 ? 0.2 : 1; // reduced steering in air
 
                 // Steering: keyboard + gamepad right stick
@@ -2264,7 +2843,9 @@
                     dt *
                     (car.speed !== 0 ? 1 : 0) *
                     airFactor;
+            }
 
+            function applyCarThrottle(dt) {
                 // Acceleration/braking: keyboard + gamepad analog triggers
                 let accelInput = 0,
                     brakeInput = 0;
@@ -2291,24 +2872,9 @@
                     -car.maxSpeed * 0.4,
                     Math.min(car.maxSpeed, car.speed),
                 );
+            }
 
-                // Off-track penalty: heavy friction when not on the track
-                const tileCol = Math.round(car.col),
-                    tileRow = Math.round(car.row);
-                const onTrack =
-                    tileCol >= 0 &&
-                    tileCol < MAP_SIZE &&
-                    tileRow >= 0 &&
-                    tileRow < MAP_SIZE &&
-                    trackMap[tileRow][tileCol] > 0;
-                if (!onTrack && car.airHeight <= 0) {
-                    car.speed *= 1 - _tuneBounce.offDrag * dt; // drag off-track
-                    car.speed = Math.max(
-                        -car.maxSpeed * 0.15,
-                        Math.min(car.maxSpeed * 0.3, car.speed),
-                    );
-                }
-
+            function applySlopeResistance(dt) {
                 // Slope resistance (only when on ground)
                 const hNow = getTerrainHeight(car.col, car.row);
                 const hAhead = getTerrainHeight(
@@ -2325,7 +2891,9 @@
                         car.speed *= 1 - roughness * 2 * dt;
                     }
                 }
+            }
 
+            function applyPowerslide(dt, onTrack) {
                 // Powerslide model: the heading sets the *desired* velocity and
                 // the actual velocity vector catches up at the grip rate. The
                 // gap between the two is lateral slip — that's the skid.
@@ -2348,7 +2916,9 @@
                 car.row += car.vy * dt;
                 car.col = Math.max(0, Math.min(MAP_SIZE - 1, car.col));
                 car.row = Math.max(0, Math.min(MAP_SIZE - 1, car.row));
+            }
 
+            function enforceTrackBoundary(dt) {
                 // Track boundary: hard wall — car can never leave the track
                 if (!car.bounceCooldown) car.bounceCooldown = 0;
                 car.bounceCooldown = Math.max(0, car.bounceCooldown - dt);
@@ -2432,7 +3002,9 @@
                         }
                     }
                 }
+            }
 
+            function updateCarJump(dt, onTrack) {
                 // Jump physics: detect crests by slope change in travel direction
                 const sampleDist = 0.8;
                 const hBehind = getTerrainHeight(
@@ -2506,12 +3078,6 @@
                         car.jumpBaseH = 0;
                     }
                 }
-
-                // Skid marks while sliding on the ground
-                updateSkidMarks(car, car.slip > 3.2 && car.airHeight <= 0);
-
-                // Checkpoint crossing detection
-                updateCheckpoints();
             }
 
             // Line segment intersection: does segment (p1->p2) cross segment (p3->p4)?
@@ -2986,7 +3552,7 @@
                 const initialPathIdx = (startLineIdx + 6) % totalPts;
 
                 // Pick drivers whose colour doesn't clash with the player's car
-                const playerTop = CAR_TYPES[carSelIdx].colors.top;
+                const playerTop = CAR_TYPES[ui.carSelIdx].colors.top;
                 let roster = AI_POOL.filter(
                     (d) => demo || d.colors.top !== playerTop,
                 );
@@ -3331,11 +3897,50 @@
                     dy = Math.sin(carObj.angle);
                 const px = -dy,
                     py = dx;
+                const basis = { dx, dy, px, py };
                 const air = carObj.airHeight || 0;
                 const centerH = carObj.airborne
                     ? (carObj.jumpBaseH || 0) + air
                     : getTerrainHeight(carObj.col, carObj.row) + air;
+                const { pitch, roll } = computeCarPitchRoll(carObj, basis, air);
 
+                // Project a car-local [fwd, side, up] point to screen; shared
+                // with the helpers below via parameter.
+                function carPt(fwd, side, up) {
+                    fwd *= CAR_SCALE;
+                    side *= CAR_SCALE;
+                    up *= CAR_SCALE * CAR_TALL;
+                    const c = carObj.col + dx * fwd + px * side;
+                    const r = carObj.row + dy * fwd + py * side;
+                    const tilt = fwd * pitch + side * roll;
+                    return toScreen(c, r, centerH + up + tilt);
+                }
+
+                const { mesh, prof, pNose, pTail, noseF, tailF, maxW } =
+                    resolveCarMesh(shape);
+
+                drawCarShadow(carObj, basis, centerH, air, noseF, tailF, maxW);
+
+                const wh = mesh.wheels;
+                const ride = mesh.ride || 0;
+                const faces = collectCarFaces(
+                    mesh,
+                    prof,
+                    pNose,
+                    pTail,
+                    colors,
+                    carPt,
+                    basis,
+                    ride,
+                );
+                const wheelGeo = addWheelFaces(faces, wh, carPt, basis);
+                drawCarFaces(faces, colors, wheelGeo, basis);
+                drawCarDecal(mesh, num, colors, carPt, ride);
+                drawCarEndDecorations(mesh, colors, carPt, basis, ride, pNose, pTail);
+            }
+
+            function computeCarPitchRoll(carObj, basis, air) {
+                const { dx, dy, px, py } = basis;
                 // Compute pitch (forward slope) and roll (side slope) from terrain
                 let pitch = 0,
                     roll = 0;
@@ -3366,30 +3971,38 @@
                         Math.min(0.6, (hLeft - hRight) / (sampleDist * 2)),
                     );
                 }
+                return { pitch, roll };
+            }
 
-                function carPt(fwd, side, up) {
-                    fwd *= CAR_SCALE;
-                    side *= CAR_SCALE;
-                    up *= CAR_SCALE * CAR_TALL;
-                    const c = carObj.col + dx * fwd + px * side;
-                    const r = carObj.row + dy * fwd + py * side;
-                    const tilt = fwd * pitch + side * roll;
-                    return toScreen(c, r, centerH + up + tilt);
-                }
-
-                const mesh = CAR_MESHES[shape] || CAR_MESHES.compact;
-                const prof = mesh.profile;
+            function resolveCarMesh(shape) {
+                // Custom cars pass their parsed mesh object as `shape`
+                const mesh =
+                    typeof shape === "object"
+                        ? shape
+                        : CAR_MESHES[shape] || CAR_MESHES.compact;
+                const prof = mesh.profile || [];
                 const pNose = prof[0],
                     pTail = prof[prof.length - 1];
-                let maxW = 0;
-                for (const p of prof) if (p.w > maxW) maxW = p.w;
+                let noseF, tailF, maxW;
+                if (mesh.custom) {
+                    ({ fNose: noseF, fTail: tailF, maxW } = mesh.bounds);
+                } else {
+                    noseF = pNose.f;
+                    tailF = pTail.f;
+                    maxW = 0;
+                    for (const p of prof) if (p.w > maxW) maxW = p.w;
+                }
+                return { mesh, prof, pNose, pTail, noseF, tailF, maxW };
+            }
 
+            function drawCarShadow(carObj, basis, centerH, air, noseF, tailF, maxW) {
+                const { dx, dy, px, py } = basis;
                 // Shadow on ground
                 const shGnd = [
-                    [pNose.f, maxW],
-                    [pNose.f, -maxW],
-                    [pTail.f, -maxW],
-                    [pTail.f, maxW],
+                    [noseF, maxW],
+                    [noseF, -maxW],
+                    [tailF, -maxW],
+                    [tailF, maxW],
                 ].map(([f, s]) =>
                     toScreen(
                         carObj.col + (dx * f + px * s) * CAR_SCALE,
@@ -3404,16 +4017,19 @@
                 ctx.closePath();
                 ctx.fillStyle = "rgba(0,0,0,0.25)";
                 ctx.fill();
+            }
 
-                const wh = mesh.wheels;
-
+            function collectCarFaces(mesh, prof, pNose, pTail, colors, carPt, basis, ride) {
+                const { dx, dy, px, py } = basis;
                 // Collect shaded faces, painter-sort, draw back-to-front.
                 // lp = local [fwd, side, up] points. The body floats `ride`
                 // above the wheels, like the high-riding original sprites;
                 // wheels and shadow stay on the ground.
-                const ride = mesh.ride || 0;
                 const faces = [];
-                function addFace(lp, baseColor) {
+                // selfStroke: outline the face in its own color instead of
+                // colors.stroke — hides the triangulation wireframe (and
+                // the antialiasing seams between fills) on custom meshes.
+                function addFace(lp, baseColor, selfStroke) {
                     const ax = lp[1][0] - lp[0][0],
                         ay = lp[1][1] - lp[0][1],
                         az = lp[1][2] - lp[0][2];
@@ -3447,14 +4063,25 @@
                             wy * CAR_LIGHT[1] +
                             wz * CAR_LIGHT[2],
                     );
+                    // Painter depth along the isometric view axis. The
+                    // projection's depth direction (its screen null space)
+                    // is (col, row, up) = (1, 1, 2): height counts double,
+                    // so a roof sorts in front of the floor beneath it
+                    // instead of fighting it. Without the up term, closed
+                    // imported meshes mis-order and look inside-out.
                     let depth = 0;
                     for (const p of lp)
                         depth +=
-                            dx * p[0] + px * p[1] + dy * p[0] + py * p[1];
+                            dx * p[0] +
+                            px * p[1] +
+                            dy * p[0] +
+                            py * p[1] +
+                            2 * p[2];
                     faces.push({
                         pts: lp.map((p) => carPt(p[0], p[1], p[2] + ride)),
                         depth: depth / lp.length,
                         color: hexShade(baseColor, 0.38 + 0.88 * lit),
+                        selfStroke,
                     });
                 }
                 function addBoxPart(f0, f1, w, h0, h1, color) {
@@ -3504,6 +4131,14 @@
                         color,
                     );
                 }
+
+                // User-made OBJ body: pre-mapped triangles, per-face color.
+                // Drawn two-sided and back-to-front (see depth sort below),
+                // so a closed mesh paints its far faces first and the near
+                // faces over them — no culling, robust to any winding or
+                // concavity in the imported model.
+                if (mesh.custom)
+                    for (const t of mesh.tris) addFace(t.p, t.kd, true);
 
                 // Loft the hull between consecutive stations
                 for (let i = 0; i < prof.length - 1; i++) {
@@ -3560,8 +4195,10 @@
                         color,
                     );
                 }
-                capFace(pNose, mesh.pig ? colors.dark : colors.top);
-                capFace(pTail, colors.top);
+                if (!mesh.custom) {
+                    capFace(pNose, mesh.pig ? colors.dark : colors.top);
+                    capFace(pTail, colors.top);
+                }
 
                 // Shape extras
                 if (mesh.spoiler) {
@@ -3592,7 +4229,11 @@
                         );
                     }
                 }
+                return faces;
+            }
 
+            function addWheelFaces(faces, wh, carPt, basis) {
+                const { dx, dy, px, py } = basis;
                 // Wheels join the painter sort so the near-side pair drawn
                 // last overlaps the body, like the fat tires on the original
                 // sprites. The axle height puts the tire bottom on the ground.
@@ -3613,19 +4254,42 @@
                 const twLoc = (wh.r / (TILE_DEPTH * CAR_TALL)) * 0.16;
                 const trdX = (px - py) * (TILE_W / 2) * CAR_SCALE * twLoc,
                     trdY = (px + py) * (TILE_H / 2) * CAR_SCALE * twLoc;
+                // A tire is a big disc overlapping many body triangles at
+                // different depths, so a single averaged depth can't sort it
+                // reliably against the body. The wheel that occludes wrong is
+                // always one on the FAR lateral side (the body sits between it
+                // and the camera): push those fully behind the body so they
+                // only show where they stick past the silhouette. Near-side
+                // wheels sort naturally and overlap the body as before.
+                let bMin = Infinity;
+                for (const fc of faces) if (fc.depth < bMin) bMin = fc.depth;
                 for (const [f, s] of [
                     [wh.front, wh.side],
                     [wh.front, -wh.side],
                     [wh.back, wh.side],
                     [wh.back, -wh.side],
                 ]) {
+                    // lateral position toward the camera: <0 = far side
+                    const lateral = (px + py) * s;
+                    const natural = (dx + dy) * f + (px + py) * s + 2 * axleUp;
                     faces.push({
                         wheel: carPt(f, s, axleUp),
                         sgn: s >= 0 ? 1 : -1,
-                        depth: (dx + dy) * f + (px + py) * s,
+                        // far-side wheels forced behind the whole body; the
+                        // tiny natural term keeps the far pair's own order
+                        depth:
+                            lateral < 0
+                                ? bMin - 1 + natural * 1e-3
+                                : natural,
                     });
 
                 }
+                return { whx, why, wvy, trdX, trdY };
+            }
+
+            function drawCarFaces(faces, colors, wheelGeo, basis) {
+                const { px, py } = basis;
+                const { whx, why, wvy, trdX, trdY } = wheelGeo;
                 function wheelEllipse(cx2, cy2, k) {
                     ctx.beginPath();
                     for (let i = 0; i <= 12; i++) {
@@ -3699,9 +4363,17 @@
                     ctx.closePath();
                     ctx.fillStyle = fc.color;
                     ctx.fill();
-                    ctx.stroke();
+                    if (fc.selfStroke) {
+                        ctx.strokeStyle = fc.color;
+                        ctx.stroke();
+                        ctx.strokeStyle = colors.stroke;
+                    } else {
+                        ctx.stroke();
+                    }
                 }
+            }
 
+            function drawCarDecal(mesh, num, colors, carPt, ride) {
                 // Race number decal, projected flat onto the hood/roof plane
                 // like the painted numbers on the original sprites.
                 if (mesh.decal && num != null) {
@@ -3730,7 +4402,10 @@
                     ctx.fillText(num, 0, 0);
                     ctx.restore();
                 }
+            }
 
+            function drawCarEndDecorations(mesh, colors, carPt, basis, ride, pNose, pTail) {
+                const { dx, dy } = basis;
                 // Decorations on the nose/tail caps, only when that end of
                 // the car points toward the camera.
                 const camDot = (dx + dy) * 0.53;
@@ -3836,16 +4511,6 @@
 
             // Player colours/shape follow the selected car type
             let PLAYER_COLORS = CAR_TYPES[0].colors;
-
-            function drawCar() {
-                PLAYER_COLORS = CAR_TYPES[carSelIdx].colors;
-                drawCarGeneric(
-                    car,
-                    PLAYER_COLORS,
-                    CAR_TYPES[carSelIdx].shape,
-                    CAR_TYPES[carSelIdx].num,
-                );
-            }
 
             // ── Viewport Culling ───────────────────────────────────────────────────
             function getVisibleRange() {
@@ -4031,9 +4696,13 @@
             // ── Input Handling ─────────────────────────────────────────────────────
             const keys = new Set();
 
-            let showFPS = false;
-            let showTuning = false;
-            let showCheckpoints = false;
+            // Debug overlays and tuning panel (Z/X/C during a race)
+            const debug = {
+                showFPS: false,
+                showTuning: false,
+                showCheckpoints: false,
+                tuningSelected: 0,
+            };
             const fpsHistory = [];
             const FPS_HISTORY_MAX = 120;
 
@@ -4208,7 +4877,6 @@
                     step: 2,
                 },
             ];
-            let tuningSelected = 0;
 
             const _tuneBounce = {
                 push: 0.8,
@@ -4257,7 +4925,7 @@
                     const pct = (val - p.min) / (p.max - p.min);
 
                     // Highlight selected
-                    if (i === tuningSelected) {
+                    if (i === debug.tuningSelected) {
                         ctx.fillStyle = "rgba(255,255,100,0.15)";
                         ctx.fillRect(px + 2, y - 10, panelW - 4, lineH);
                         ctx.fillStyle = "#ff0";
@@ -4280,7 +4948,7 @@
                         barH = 8;
                     ctx.fillStyle = "#333";
                     ctx.fillRect(barX, y - 4, barW, barH);
-                    ctx.fillStyle = i === tuningSelected ? "#ff0" : "#0af";
+                    ctx.fillStyle = i === debug.tuningSelected ? "#ff0" : "#0af";
                     ctx.fillRect(barX, y - 4, barW * pct, barH);
                 }
             }
@@ -4305,11 +4973,19 @@
                     return;
                 }
 
+                uiKey(k);
+            });
+
+            // Single state dispatcher for UI keys. Keyboard events land
+            // here directly; the gamepad handler synthesizes key names
+            // (arrows/Enter/Escape) and routes them through here too, so
+            // per-state behavior only exists once.
+            function uiKey(k) {
                 switch (gameState) {
                     case STATE.TITLE:
                         if (k === "Enter" || k === " ") {
                             sfxMenuSelect();
-                            menuIdx = 0;
+                            ui.menuIdx = 0;
                             gameState = STATE.MENU;
                         }
                         break;
@@ -4336,16 +5012,15 @@
                             enterTitle();
                         break;
                     case STATE.RACING:
-                        raceKey(e);
+                        raceKey(k);
                         break;
                     case STATE.PAUSED:
                         pauseKey(k);
                         break;
                 }
-            });
+            }
 
-            function raceKey(e) {
-                const k = e.key;
+            function raceKey(k) {
                 if (race.finished) {
                     if (k === "Enter" || k === " ") {
                         sfxMenuSelect();
@@ -4367,24 +5042,24 @@
                     startLevel(LEVELS.indexOf(currentLevel));
                     return;
                 }
-                if (k === "z" || k === "Z") showFPS = !showFPS;
-                if (k === "x" || k === "X") showTuning = !showTuning;
-                if (k === "c" || k === "C") showCheckpoints = !showCheckpoints;
+                if (k === "z" || k === "Z") debug.showFPS = !debug.showFPS;
+                if (k === "x" || k === "X") debug.showTuning = !debug.showTuning;
+                if (k === "c" || k === "C") debug.showCheckpoints = !debug.showCheckpoints;
                 // Tuning panel controls (I/K = up/down, J/L = adjust)
-                if (showTuning) {
+                if (debug.showTuning) {
                     if (k === "i" || k === "I") {
-                        tuningSelected =
-                            (tuningSelected - 1 + tuningParams.length) %
+                        debug.tuningSelected =
+                            (debug.tuningSelected - 1 + tuningParams.length) %
                             tuningParams.length;
                         return;
                     }
                     if (k === "k" || k === "K") {
-                        tuningSelected =
-                            (tuningSelected + 1) % tuningParams.length;
+                        debug.tuningSelected =
+                            (debug.tuningSelected + 1) % tuningParams.length;
                         return;
                     }
                     if (k === "j" || k === "J" || k === "l" || k === "L") {
-                        const p = tuningParams[tuningSelected];
+                        const p = tuningParams[debug.tuningSelected];
                         const dir = k === "l" || k === "L" ? 1 : -1;
                         p.set(
                             Math.round(
@@ -4406,17 +5081,17 @@
                     return;
                 }
                 if (k === "ArrowUp" || k === "w" || k === "W") {
-                    pauseIdx = (pauseIdx + 2) % 3;
+                    ui.pauseIdx = (ui.pauseIdx + 2) % 3;
                     sfxMenuMove();
                 }
                 if (k === "ArrowDown" || k === "s" || k === "S") {
-                    pauseIdx = (pauseIdx + 1) % 3;
+                    ui.pauseIdx = (ui.pauseIdx + 1) % 3;
                     sfxMenuMove();
                 }
                 if (k === "Enter" || k === " ") {
                     sfxMenuSelect();
-                    if (pauseIdx === 0) resumePause();
-                    else if (pauseIdx === 1)
+                    if (ui.pauseIdx === 0) resumePause();
+                    else if (ui.pauseIdx === 1)
                         startLevel(LEVELS.indexOf(currentLevel));
                     else enterTitle();
                 }
@@ -4427,15 +5102,19 @@
             // ── Engine Sound (Physically-informed cylinder + waveguide synthesis) ─
             // Based on: cylinder pressure simulation + waveguide exhaust pipes
             // Reference: AngeTheGreat engine-sim, Antonio-R1 engine-sound-generator
-            let audioCtx = null;
-            let engineNodes = null;
-            let aiEngineNodes = [];
-            let noiseBuffer = null;
-            let masterBus = null; // everything routes through here (mute)
-            let sfxGain = null;
-            let musicGain = null;
-            let skidGain = null;
-            let soundToast = 0;
+            // All WebAudio state: context, mix buses, engine synth nodes
+            const audio = {
+                ctx: null,
+                engineNodes: null,
+                aiEngineNodes: [],
+                noiseBuffer: null,
+                masterBus: null, // everything routes through here (mute)
+                sfxGain: null,
+                musicGain: null,
+                skidGain: null,
+                soundToast: 0,
+                soundOn: loadPref("sound", "on") !== "off",
+            };
 
             const IDLE_RPM = 1200;
             const MAX_RPM = 3000;
@@ -4643,27 +5322,27 @@
             }
 
             function initAudio() {
-                if (audioCtx) return;
-                audioCtx = new (
+                if (audio.ctx) return;
+                audio.ctx = new (
                     window.AudioContext || window.webkitAudioContext
                 )();
-                const sampleRate = audioCtx.sampleRate;
+                const sampleRate = audio.ctx.sampleRate;
 
                 // Master bus: one mute switch for everything
-                masterBus = audioCtx.createGain();
-                masterBus.gain.value = soundOn ? 1 : 0;
-                masterBus.connect(audioCtx.destination);
-                sfxGain = audioCtx.createGain();
-                sfxGain.gain.value = 0.5;
-                sfxGain.connect(masterBus);
-                musicGain = audioCtx.createGain();
-                musicGain.gain.value = 0.35;
-                musicGain.connect(masterBus);
+                audio.masterBus = audio.ctx.createGain();
+                audio.masterBus.gain.value = audio.soundOn ? 1 : 0;
+                audio.masterBus.connect(audio.ctx.destination);
+                audio.sfxGain = audio.ctx.createGain();
+                audio.sfxGain.gain.value = 0.5;
+                audio.sfxGain.connect(audio.masterBus);
+                audio.musicGain = audio.ctx.createGain();
+                audio.musicGain.gain.value = 0.35;
+                audio.musicGain.connect(audio.masterBus);
 
                 // Shared noise buffer
                 const noiseSize = sampleRate;
-                noiseBuffer = audioCtx.createBuffer(1, noiseSize, sampleRate);
-                const noiseData = noiseBuffer.getChannelData(0);
+                audio.noiseBuffer = audio.ctx.createBuffer(1, noiseSize, sampleRate);
+                const noiseData = audio.noiseBuffer.getChannelData(0);
                 for (let i = 0; i < noiseSize; i++)
                     noiseData[i] = Math.random() * 2 - 1;
 
@@ -4676,7 +5355,7 @@
                 // car) + 4 AI (4 cyl each, covers the demo grid too)
                 const playerEngine = createEngineState(
                     sampleRate,
-                    CAR_TYPES[carSelIdx].cylinders,
+                    CAR_TYPES[ui.carSelIdx].cylinders,
                 );
                 const aiEngines = [];
                 for (let i = 0; i < 4; i++) {
@@ -4685,7 +5364,7 @@
 
                 let noiseIdx = 0;
                 const bufSize = 512;
-                const engineProcessor = audioCtx.createScriptProcessor(
+                const engineProcessor = audio.ctx.createScriptProcessor(
                     bufSize,
                     0,
                     1,
@@ -4693,14 +5372,14 @@
 
                 engineProcessor.onaudioprocess = function (e) {
                     const output = e.outputBuffer.getChannelData(0);
-                    if (!engineNodes) {
+                    if (!audio.engineNodes) {
                         output.fill(0);
                         return;
                     }
-                    // Read through engineNodes so the player engine can be
+                    // Read through audio.engineNodes so the player engine can be
                     // swapped when a different car is selected
-                    const playerEngine = engineNodes.playerEngine;
-                    const aiEngines = engineNodes.aiEngines;
+                    const playerEngine = audio.engineNodes.playerEngine;
+                    const aiEngines = audio.engineNodes.aiEngines;
                     const cfg = _tuneAudio;
 
                     // Player RPM from throttle
@@ -4751,34 +5430,34 @@
                 };
 
                 // EQ chain
-                const highpass = audioCtx.createBiquadFilter();
+                const highpass = audio.ctx.createBiquadFilter();
                 highpass.type = "highpass";
                 highpass.frequency.value = 30;
                 highpass.Q.value = 0.5;
 
-                const presence = audioCtx.createBiquadFilter();
+                const presence = audio.ctx.createBiquadFilter();
                 presence.type = "peaking";
                 presence.frequency.value = 200;
                 presence.Q.value = 1.5;
                 presence.gain.value = _tuneAudio.presenceGain;
 
-                const warmth = audioCtx.createBiquadFilter();
+                const warmth = audio.ctx.createBiquadFilter();
                 warmth.type = "peaking";
                 warmth.frequency.value = 80;
                 warmth.Q.value = 2;
                 warmth.gain.value = _tuneAudio.warmthGain;
 
-                const masterGain = audioCtx.createGain();
+                const masterGain = audio.ctx.createGain();
                 masterGain.gain.value = _tuneAudio.masterVolume;
 
                 engineProcessor.connect(highpass);
                 highpass.connect(warmth);
                 warmth.connect(presence);
                 presence.connect(masterGain);
-                masterGain.connect(masterBus);
+                masterGain.connect(audio.masterBus);
 
                 // Store references
-                engineNodes = {
+                audio.engineNodes = {
                     playerEngine,
                     aiEngines,
                     masterGain,
@@ -4787,103 +5466,103 @@
                     engineProcessor,
                     sampleRate,
                 };
-                aiEngineNodes = aiEngines;
+                audio.aiEngineNodes = aiEngines;
 
                 // Terrain noise channel (gravel/grass crunch)
-                const terrainNoise = audioCtx.createBufferSource();
-                terrainNoise.buffer = noiseBuffer;
+                const terrainNoise = audio.ctx.createBufferSource();
+                terrainNoise.buffer = audio.noiseBuffer;
                 terrainNoise.loop = true;
-                const terrainGain = audioCtx.createGain();
+                const terrainGain = audio.ctx.createGain();
                 terrainGain.gain.value = 0;
-                const terrainFilter = audioCtx.createBiquadFilter();
+                const terrainFilter = audio.ctx.createBiquadFilter();
                 terrainFilter.type = "bandpass";
                 terrainFilter.frequency.value = 800;
                 terrainFilter.Q.value = 0.8;
                 terrainNoise.connect(terrainFilter);
                 terrainFilter.connect(terrainGain);
-                terrainGain.connect(masterBus);
+                terrainGain.connect(audio.masterBus);
                 terrainNoise.start();
-                engineNodes.terrainGain = terrainGain;
-                engineNodes.terrainFilter = terrainFilter;
+                audio.engineNodes.terrainGain = terrainGain;
+                audio.engineNodes.terrainFilter = terrainFilter;
 
                 // Tyre squeal channel (player slide)
-                const skidSrc = audioCtx.createBufferSource();
-                skidSrc.buffer = noiseBuffer;
+                const skidSrc = audio.ctx.createBufferSource();
+                skidSrc.buffer = audio.noiseBuffer;
                 skidSrc.loop = true;
-                const skidFilter = audioCtx.createBiquadFilter();
+                const skidFilter = audio.ctx.createBiquadFilter();
                 skidFilter.type = "bandpass";
                 skidFilter.frequency.value = 1300;
                 skidFilter.Q.value = 1.4;
-                skidGain = audioCtx.createGain();
-                skidGain.gain.value = 0;
+                audio.skidGain = audio.ctx.createGain();
+                audio.skidGain.gain.value = 0;
                 skidSrc.connect(skidFilter);
-                skidFilter.connect(skidGain);
-                skidGain.connect(masterBus);
+                skidFilter.connect(audio.skidGain);
+                audio.skidGain.connect(audio.masterBus);
                 skidSrc.start();
             }
 
             function swapPlayerEngine(cylinders) {
-                if (!engineNodes) return;
+                if (!audio.engineNodes) return;
                 if (
-                    engineNodes.playerEngine.cylinders.length === cylinders
+                    audio.engineNodes.playerEngine.cylinders.length === cylinders
                 )
                     return;
-                engineNodes.playerEngine = createEngineState(
-                    engineNodes.sampleRate,
+                audio.engineNodes.playerEngine = createEngineState(
+                    audio.engineNodes.sampleRate,
                     cylinders,
                 );
             }
 
             function setSkidLevel(x) {
-                if (!skidGain || !audioCtx) return;
-                skidGain.gain.setTargetAtTime(
+                if (!audio.skidGain || !audio.ctx) return;
+                audio.skidGain.gain.setTargetAtTime(
                     x * 0.3,
-                    audioCtx.currentTime,
+                    audio.ctx.currentTime,
                     0.05,
                 );
             }
 
             function silenceEngines() {
-                if (!engineNodes) return;
-                engineNodes.playerEngine.targetThrottle = 0.05;
-                engineNodes.playerEngine.volume = 0;
-                for (const eng of aiEngineNodes) {
+                if (!audio.engineNodes) return;
+                audio.engineNodes.playerEngine.targetThrottle = 0.05;
+                audio.engineNodes.playerEngine.volume = 0;
+                for (const eng of audio.aiEngineNodes) {
                     eng.targetThrottle = 0.05;
                     eng.volume = 0;
                 }
-                engineNodes.terrainGain.gain.setTargetAtTime(
+                audio.engineNodes.terrainGain.gain.setTargetAtTime(
                     0,
-                    audioCtx.currentTime,
+                    audio.ctx.currentTime,
                     0.05,
                 );
                 setSkidLevel(0);
             }
 
             function toggleSound() {
-                soundOn = !soundOn;
-                savePref("sound", soundOn ? "on" : "off");
-                if (audioCtx && masterBus) {
-                    masterBus.gain.setTargetAtTime(
-                        soundOn ? 1 : 0,
-                        audioCtx.currentTime,
+                audio.soundOn = !audio.soundOn;
+                savePref("sound", audio.soundOn ? "on" : "off");
+                if (audio.ctx && audio.masterBus) {
+                    audio.masterBus.gain.setTargetAtTime(
+                        audio.soundOn ? 1 : 0,
+                        audio.ctx.currentTime,
                         0.03,
                     );
                 }
-                soundToast = performance.now();
+                audio.soundToast = performance.now();
             }
 
             // ── Sound Effects (all synthesized) ────────────────────────────────
             function sfxBeep(freq, dur, type = "square", vol = 0.25, delay = 0) {
-                if (!audioCtx || !sfxGain) return;
-                const t = audioCtx.currentTime + delay;
-                const o = audioCtx.createOscillator();
+                if (!audio.ctx || !audio.sfxGain) return;
+                const t = audio.ctx.currentTime + delay;
+                const o = audio.ctx.createOscillator();
                 o.type = type;
                 o.frequency.value = freq;
-                const g = audioCtx.createGain();
+                const g = audio.ctx.createGain();
                 g.gain.setValueAtTime(vol, t);
                 g.gain.exponentialRampToValueAtTime(0.001, t + dur);
                 o.connect(g);
-                g.connect(sfxGain);
+                g.connect(audio.sfxGain);
                 o.start(t);
                 o.stop(t + dur + 0.05);
             }
@@ -4903,31 +5582,31 @@
             }
 
             function sfxThud(intensity) {
-                if (!audioCtx || !sfxGain) return;
-                const t = audioCtx.currentTime;
-                const o = audioCtx.createOscillator();
+                if (!audio.ctx || !audio.sfxGain) return;
+                const t = audio.ctx.currentTime;
+                const o = audio.ctx.createOscillator();
                 o.type = "sine";
                 o.frequency.setValueAtTime(90, t);
                 o.frequency.exponentialRampToValueAtTime(35, t + 0.12);
-                const g = audioCtx.createGain();
+                const g = audio.ctx.createGain();
                 g.gain.setValueAtTime(0.5 * intensity, t);
                 g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
                 o.connect(g);
-                g.connect(sfxGain);
+                g.connect(audio.sfxGain);
                 o.start(t);
                 o.stop(t + 0.2);
-                if (noiseBuffer) {
-                    const src = audioCtx.createBufferSource();
-                    src.buffer = noiseBuffer;
-                    const ng = audioCtx.createGain();
+                if (audio.noiseBuffer) {
+                    const src = audio.ctx.createBufferSource();
+                    src.buffer = audio.noiseBuffer;
+                    const ng = audio.ctx.createGain();
                     ng.gain.setValueAtTime(0.25 * intensity, t);
                     ng.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
-                    const lp = audioCtx.createBiquadFilter();
+                    const lp = audio.ctx.createBiquadFilter();
                     lp.type = "lowpass";
                     lp.frequency.value = 900;
                     src.connect(lp);
                     lp.connect(ng);
-                    ng.connect(sfxGain);
+                    ng.connect(audio.sfxGain);
                     src.start(t);
                     src.stop(t + 0.12);
                 }
@@ -4963,21 +5642,21 @@
             }
 
             function musicNote(freq, when, dur, type, vol) {
-                const o = audioCtx.createOscillator();
+                const o = audio.ctx.createOscillator();
                 o.type = type;
                 o.frequency.value = freq;
-                const g = audioCtx.createGain();
+                const g = audio.ctx.createGain();
                 g.gain.setValueAtTime(0.0001, when);
                 g.gain.linearRampToValueAtTime(vol, when + 0.012);
                 g.gain.exponentialRampToValueAtTime(0.001, when + dur);
                 o.connect(g);
-                g.connect(musicGain);
+                g.connect(audio.musicGain);
                 o.start(when);
                 o.stop(when + dur + 0.05);
             }
 
             function scheduleMusic() {
-                if (!audioCtx || !musicGain || !noiseBuffer) return;
+                if (!audio.ctx || !audio.musicGain || !audio.noiseBuffer) return;
                 const inMenus =
                     gameState === STATE.TITLE ||
                     gameState === STATE.MENU ||
@@ -4986,11 +5665,11 @@
                     gameState === STATE.HOWTO ||
                     gameState === STATE.STANDINGS ||
                     gameState === STATE.CHAMPION;
-                if (!inMenus || !soundOn) {
+                if (!inMenus || !audio.soundOn) {
                     music.playing = false;
                     return;
                 }
-                const now = audioCtx.currentTime;
+                const now = audio.ctx.currentTime;
                 if (!music.playing) {
                     music.playing = true;
                     music.step = 0;
@@ -5029,32 +5708,32 @@
                     );
                     // Hat on offbeats
                     if (step % 4 === 2) {
-                        const src = audioCtx.createBufferSource();
-                        src.buffer = noiseBuffer;
+                        const src = audio.ctx.createBufferSource();
+                        src.buffer = audio.noiseBuffer;
                         src.playbackRate.value = 2;
-                        const g = audioCtx.createGain();
+                        const g = audio.ctx.createGain();
                         g.gain.setValueAtTime(0.1, t);
                         g.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
-                        const hp = audioCtx.createBiquadFilter();
+                        const hp = audio.ctx.createBiquadFilter();
                         hp.type = "highpass";
                         hp.frequency.value = 6500;
                         src.connect(hp);
                         hp.connect(g);
-                        g.connect(musicGain);
+                        g.connect(audio.musicGain);
                         src.start(t);
                         src.stop(t + 0.06);
                     }
                     // Kick on quarters
                     if (step % 4 === 0) {
-                        const o = audioCtx.createOscillator();
+                        const o = audio.ctx.createOscillator();
                         o.type = "sine";
                         o.frequency.setValueAtTime(110, t);
                         o.frequency.exponentialRampToValueAtTime(40, t + 0.1);
-                        const g = audioCtx.createGain();
+                        const g = audio.ctx.createGain();
                         g.gain.setValueAtTime(0.45, t);
                         g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
                         o.connect(g);
-                        g.connect(musicGain);
+                        g.connect(audio.musicGain);
                         o.start(t);
                         o.stop(t + 0.15);
                     }
@@ -5064,19 +5743,19 @@
             }
 
             function updateEngineSound(dt) {
-                if (!engineNodes) return;
+                if (!audio.engineNodes) return;
 
                 // Outside racing (title demo / menus): player engine silent,
                 // AI engines quietly audible near the camera focus
                 if (gameState !== STATE.RACING) {
-                    engineNodes.playerEngine.targetThrottle = 0.05;
-                    engineNodes.playerEngine.volume = 0;
+                    audio.engineNodes.playerEngine.targetThrottle = 0.05;
+                    audio.engineNodes.playerEngine.volume = 0;
                     const focus = demoFocus();
-                    for (let i = 0; i < aiEngineNodes.length; i++) {
+                    for (let i = 0; i < audio.aiEngineNodes.length; i++) {
                         const ai = aiCars[i];
                         if (!ai || !focus) {
-                            aiEngineNodes[i].targetThrottle = 0.05;
-                            aiEngineNodes[i].volume = 0;
+                            audio.aiEngineNodes[i].targetThrottle = 0.05;
+                            audio.aiEngineNodes[i].volume = 0;
                             continue;
                         }
                         const dx = ai.col - focus.col,
@@ -5085,17 +5764,17 @@
                         const maxHearDist = 35;
                         if (dist < maxHearDist) {
                             const prox = 1 - dist / maxHearDist;
-                            aiEngineNodes[i].targetThrottle =
+                            audio.aiEngineNodes[i].targetThrottle =
                                 (Math.abs(ai.speed) / ai.maxSpeed) * 0.6;
-                            aiEngineNodes[i].volume = prox * prox * 0.4;
+                            audio.aiEngineNodes[i].volume = prox * prox * 0.4;
                         } else {
-                            aiEngineNodes[i].targetThrottle = 0;
-                            aiEngineNodes[i].volume = 0;
+                            audio.aiEngineNodes[i].targetThrottle = 0;
+                            audio.aiEngineNodes[i].volume = 0;
                         }
                     }
-                    engineNodes.terrainGain.gain.setTargetAtTime(
+                    audio.engineNodes.terrainGain.gain.setTargetAtTime(
                         0,
-                        audioCtx.currentTime,
+                        audio.ctx.currentTime,
                         0.05,
                     );
                     setSkidLevel(0);
@@ -5106,22 +5785,22 @@
                 const cfg = _tuneAudio;
 
                 // Update EQ from tuning panel
-                engineNodes.masterGain.gain.value = cfg.masterVolume;
-                engineNodes.presence.gain.value = cfg.presenceGain;
-                engineNodes.warmth.gain.value = cfg.warmthGain;
+                audio.engineNodes.masterGain.gain.value = cfg.masterVolume;
+                audio.engineNodes.presence.gain.value = cfg.presenceGain;
+                audio.engineNodes.warmth.gain.value = cfg.warmthGain;
 
                 // When the player has finished (or race ended), force idle.
                 // The frozen update branch doesn't tick jump physics, so stale
                 // `airborne` flags would otherwise pin the engine at full rev.
                 const playerDone = !!race.results.find(r => r.name === 'Player');
                 if (race.finished || playerDone || isCountingDown()) {
-                    engineNodes.playerEngine.targetThrottle = 0.05;
-                    engineNodes.playerEngine.volume = 1.0;
-                    for (let i = 0; i < aiCars.length && i < aiEngineNodes.length; i++) {
+                    audio.engineNodes.playerEngine.targetThrottle = 0.05;
+                    audio.engineNodes.playerEngine.volume = 1.0;
+                    for (let i = 0; i < aiCars.length && i < audio.aiEngineNodes.length; i++) {
                         const ai = aiCars[i];
                         if (race.finished || isCountingDown()) {
-                            aiEngineNodes[i].targetThrottle = 0.05;
-                            aiEngineNodes[i].volume = 0;
+                            audio.aiEngineNodes[i].targetThrottle = 0.05;
+                            audio.aiEngineNodes[i].volume = 0;
                         } else {
                             // Grace window: AI still driving, keep their engines live
                             const dx = ai.col - car.col, dy = ai.row - car.row;
@@ -5129,11 +5808,11 @@
                             const maxHearDist = 30;
                             if (dist < maxHearDist) {
                                 const proximity = 1 - dist / maxHearDist;
-                                aiEngineNodes[i].targetThrottle = Math.abs(ai.speed) / ai.maxSpeed;
-                                aiEngineNodes[i].volume = proximity * proximity * 2.5;
+                                audio.aiEngineNodes[i].targetThrottle = Math.abs(ai.speed) / ai.maxSpeed;
+                                audio.aiEngineNodes[i].volume = proximity * proximity * 2.5;
                             } else {
-                                aiEngineNodes[i].targetThrottle = 0;
-                                aiEngineNodes[i].volume = 0;
+                                audio.aiEngineNodes[i].targetThrottle = 0;
+                                audio.aiEngineNodes[i].volume = 0;
                             }
                         }
                     }
@@ -5167,8 +5846,8 @@
                     throttle = Math.min(1, 0.7 + airFactor * 0.3);
                 }
 
-                engineNodes.playerEngine.targetThrottle = throttle;
-                engineNodes.playerEngine.volume = 1.0;
+                audio.engineNodes.playerEngine.targetThrottle = throttle;
+                audio.engineNodes.playerEngine.volume = 1.0;
 
                 // Terrain sound response
                 const tileCol = Math.round(car.col),
@@ -5185,56 +5864,56 @@
                     tileRow >= 0 &&
                     tileRow < MAP_SIZE &&
                     trackMap[tileRow][tileCol] === 2;
-                const t = audioCtx.currentTime;
+                const t = audio.ctx.currentTime;
                 const speedFactor = speed / car.maxSpeed;
 
                 if (onCurb && car.airHeight <= 0) {
-                    engineNodes.terrainGain.gain.setTargetAtTime(
+                    audio.engineNodes.terrainGain.gain.setTargetAtTime(
                         0.08 * speedFactor,
                         t,
                         0.02,
                     );
-                    engineNodes.terrainFilter.frequency.setTargetAtTime(
+                    audio.engineNodes.terrainFilter.frequency.setTargetAtTime(
                         1200,
                         t,
                         0.02,
                     );
-                    engineNodes.terrainFilter.Q.setTargetAtTime(2, t, 0.02);
+                    audio.engineNodes.terrainFilter.Q.setTargetAtTime(2, t, 0.02);
                 } else if (!onTrack && car.airHeight <= 0) {
                     const isWater =
                         heightMap[tileRow] &&
                         heightMap[tileRow][tileCol] < BIOMES[0].max;
                     if (isWater) {
-                        engineNodes.terrainGain.gain.setTargetAtTime(
+                        audio.engineNodes.terrainGain.gain.setTargetAtTime(
                             0.1 * speedFactor,
                             t,
                             0.02,
                         );
-                        engineNodes.terrainFilter.frequency.setTargetAtTime(
+                        audio.engineNodes.terrainFilter.frequency.setTargetAtTime(
                             600,
                             t,
                             0.02,
                         );
-                        engineNodes.terrainFilter.Q.setTargetAtTime(
+                        audio.engineNodes.terrainFilter.Q.setTargetAtTime(
                             0.5,
                             t,
                             0.02,
                         );
                     } else {
-                        engineNodes.terrainGain.gain.setTargetAtTime(
+                        audio.engineNodes.terrainGain.gain.setTargetAtTime(
                             0.05 * speedFactor,
                             t,
                             0.03,
                         );
-                        engineNodes.terrainFilter.frequency.setTargetAtTime(
+                        audio.engineNodes.terrainFilter.frequency.setTargetAtTime(
                             2000,
                             t,
                             0.03,
                         );
-                        engineNodes.terrainFilter.Q.setTargetAtTime(1, t, 0.03);
+                        audio.engineNodes.terrainFilter.Q.setTargetAtTime(1, t, 0.03);
                     }
                 } else {
-                    engineNodes.terrainGain.gain.setTargetAtTime(0, t, 0.05);
+                    audio.engineNodes.terrainGain.gain.setTargetAtTime(0, t, 0.05);
                 }
 
                 // Tyre squeal from sliding
@@ -5247,7 +5926,7 @@
                 // AI car engines: throttle and volume based on distance to player
                 for (
                     let i = 0;
-                    i < aiCars.length && i < aiEngineNodes.length;
+                    i < aiCars.length && i < audio.aiEngineNodes.length;
                     i++
                 ) {
                     const ai = aiCars[i];
@@ -5257,20 +5936,20 @@
                     const maxHearDist = 30;
                     if (dist < maxHearDist) {
                         const proximity = 1 - dist / maxHearDist;
-                        aiEngineNodes[i].targetThrottle =
+                        audio.aiEngineNodes[i].targetThrottle =
                             Math.abs(ai.speed) / ai.maxSpeed;
-                        aiEngineNodes[i].volume = proximity * proximity * 0.5;
+                        audio.aiEngineNodes[i].volume = proximity * proximity * 0.5;
                     } else {
-                        aiEngineNodes[i].volume = 0;
-                        aiEngineNodes[i].targetThrottle = 0;
+                        audio.aiEngineNodes[i].volume = 0;
+                        audio.aiEngineNodes[i].targetThrottle = 0;
                     }
                 }
             }
 
             // Start audio on first user interaction (browser requirement)
             function ensureAudio() {
-                if (!audioCtx) initAudio();
-                else if (audioCtx.state === "suspended") audioCtx.resume();
+                if (!audio.ctx) initAudio();
+                else if (audio.ctx.state === "suspended") audio.ctx.resume();
             }
             window.addEventListener("keydown", ensureAudio, { once: false });
             window.addEventListener("mousedown", ensureAudio, { once: false });
@@ -5441,49 +6120,7 @@
                 if (padEdge("a", btn(0)) || padEdge("start", btn(9)))
                     synth.push("Enter");
                 if (padEdge("b", btn(1))) synth.push("Escape");
-                for (const k of synth) {
-                    switch (gameState) {
-                        case STATE.TITLE:
-                            if (k === "Enter") {
-                                sfxMenuSelect();
-                                menuIdx = 0;
-                                gameState = STATE.MENU;
-                            }
-                            break;
-                        case STATE.MENU:
-                            menuKey(k);
-                            break;
-                        case STATE.CARSEL:
-                            carSelKey(k);
-                            break;
-                        case STATE.TRACKSEL:
-                            trackSelKey(k);
-                            break;
-                        case STATE.HOWTO:
-                            if (k === "Enter" || k === "Escape") {
-                                sfxMenuMove();
-                                gameState = STATE.MENU;
-                            }
-                            break;
-                        case STATE.STANDINGS:
-                            if (k === "Enter") standingsContinue();
-                            break;
-                        case STATE.CHAMPION:
-                            if (k === "Enter" || k === "Escape") enterTitle();
-                            break;
-                        case STATE.PAUSED:
-                            pauseKey(k === "Escape" ? "Escape" : k);
-                            break;
-                        case STATE.RACING:
-                            if (race.finished && k === "Enter") {
-                                sfxMenuSelect();
-                                resultsContinue();
-                            } else if (k === "Escape" && !race.finished) {
-                                enterPause();
-                            }
-                            break;
-                    }
-                }
+                for (const k of synth) uiKey(k);
             }
 
             // ── Update ─────────────────────────────────────────────────────────────
@@ -5855,7 +6492,7 @@
                     }
                 }
                 drawStartFinish();
-                if (showCheckpoints) drawCheckpoints();
+                if (debug.showCheckpoints) drawCheckpoints();
                 drawCheckpointFlags();
 
                 // Draw all cars sorted by depth (back to front). The player
@@ -5872,8 +6509,8 @@
                     allCars.push({
                         obj: car,
                         colors: PLAYER_COLORS,
-                        shape: CAR_TYPES[carSelIdx].shape,
-                        num: CAR_TYPES[carSelIdx].num,
+                        shape: CAR_TYPES[ui.carSelIdx].shape,
+                        num: CAR_TYPES[ui.carSelIdx].num,
                     });
                 }
                 allCars.sort(
@@ -6241,7 +6878,7 @@
             }
 
             function enterPause() {
-                pauseIdx = 0;
+                ui.pauseIdx = 0;
                 race.pausedAt = performance.now();
                 gameState = STATE.PAUSED;
                 silenceEngines();
@@ -6285,22 +6922,25 @@
 
             // ── Menu Input ─────────────────────────────────────────────────────────
             function menuKey(k) {
-                const count = 4;
+                const count = 5;
                 if (k === "ArrowUp" || k === "w" || k === "W") {
-                    menuIdx = (menuIdx + count - 1) % count;
+                    ui.menuIdx = (ui.menuIdx + count - 1) % count;
                     sfxMenuMove();
                 } else if (k === "ArrowDown" || k === "s" || k === "S") {
-                    menuIdx = (menuIdx + 1) % count;
+                    ui.menuIdx = (ui.menuIdx + 1) % count;
                     sfxMenuMove();
                 } else if (k === "Enter" || k === " ") {
                     sfxMenuSelect();
-                    if (menuIdx === 0) {
+                    if (ui.menuIdx === 0) {
                         raceMode = "quick";
                         gameState = STATE.CARSEL;
-                    } else if (menuIdx === 1) {
+                    } else if (ui.menuIdx === 1) {
                         raceMode = "champ";
                         gameState = STATE.CARSEL;
-                    } else if (menuIdx === 2) {
+                    } else if (ui.menuIdx === 2) {
+                        raceMode = "random";
+                        gameState = STATE.CARSEL;
+                    } else if (ui.menuIdx === 3) {
                         gameState = STATE.HOWTO;
                     } else {
                         toggleSound();
@@ -6313,21 +6953,26 @@
 
             function carSelKey(k) {
                 if (k === "ArrowLeft" || k === "a" || k === "A") {
-                    carSelIdx =
-                        (carSelIdx + CAR_TYPES.length - 1) % CAR_TYPES.length;
+                    ui.carSelIdx =
+                        (ui.carSelIdx + CAR_TYPES.length - 1) % CAR_TYPES.length;
                     sfxMenuMove();
                 } else if (k === "ArrowRight" || k === "d" || k === "D") {
-                    carSelIdx = (carSelIdx + 1) % CAR_TYPES.length;
+                    ui.carSelIdx = (ui.carSelIdx + 1) % CAR_TYPES.length;
                     sfxMenuMove();
                 } else if (k === "Enter" || k === " ") {
                     sfxMenuSelect();
-                    if (engineNodes)
-                        swapPlayerEngine(CAR_TYPES[carSelIdx].cylinders);
+                    if (audio.engineNodes)
+                        swapPlayerEngine(CAR_TYPES[ui.carSelIdx].cylinders);
                     if (raceMode === "champ") {
                         champ.raceIdx = 0;
                         champ.points = {};
                         champ.lastRacePts = {};
                         startLevel(0, "champ");
+                    } else if (raceMode === "random") {
+                        startLevel(
+                            Math.floor(Math.random() * LEVELS.length),
+                            "quick",
+                        );
                     } else {
                         gameState = STATE.TRACKSEL;
                     }
@@ -6341,20 +6986,20 @@
                 const n = LEVELS.length;
                 const cols = 3;
                 if (k === "ArrowLeft" || k === "a" || k === "A") {
-                    trackSelIdx = (trackSelIdx + n - 1) % n;
+                    ui.trackSelIdx = (ui.trackSelIdx + n - 1) % n;
                     sfxMenuMove();
                 } else if (k === "ArrowRight" || k === "d" || k === "D") {
-                    trackSelIdx = (trackSelIdx + 1) % n;
+                    ui.trackSelIdx = (ui.trackSelIdx + 1) % n;
                     sfxMenuMove();
                 } else if (k === "ArrowUp" || k === "w" || k === "W") {
-                    trackSelIdx = (trackSelIdx + n - cols) % n;
+                    ui.trackSelIdx = (ui.trackSelIdx + n - cols) % n;
                     sfxMenuMove();
                 } else if (k === "ArrowDown" || k === "s" || k === "S") {
-                    trackSelIdx = (trackSelIdx + cols) % n;
+                    ui.trackSelIdx = (ui.trackSelIdx + cols) % n;
                     sfxMenuMove();
                 } else if (k === "Enter" || k === " ") {
                     sfxMenuSelect();
-                    startLevel(trackSelIdx, "quick");
+                    startLevel(ui.trackSelIdx, "quick");
                 } else if (k === "Escape") {
                     sfxMenuMove();
                     gameState = STATE.CARSEL;
@@ -6479,19 +7124,20 @@
                 const cx = canvas.width / 2,
                     cy = canvas.height / 2;
                 const w = 380,
-                    h = 330;
+                    h = 380;
                 drawPanel(cx - w / 2, cy - h / 2, w, h);
                 drawCheckerStrip(cx - w / 2 + 8, cy - h / 2 + 8, w - 16, 8, 8);
                 chunkyText("SUPER SKIDDERS", cx, cy - h / 2 + 52, 28, "#ffcc00");
                 const items = [
                     "QUICK RACE",
                     "CHAMPIONSHIP",
+                    "RANDOM TRACK",
                     "HOW TO PLAY",
-                    "SOUND: " + (soundOn ? "ON" : "OFF"),
+                    "SOUND: " + (audio.soundOn ? "ON" : "OFF"),
                 ];
                 for (let i = 0; i < items.length; i++) {
-                    const y = cy - 30 + i * 52;
-                    const sel = i === menuIdx;
+                    const y = cy - h / 2 + 102 + i * 48;
+                    const sel = i === ui.menuIdx;
                     if (sel) {
                         ctx.fillStyle = "rgba(255, 204, 0, 0.12)";
                         ctx.fillRect(cx - w / 2 + 20, y - 26, w - 40, 40);
@@ -6545,7 +7191,7 @@
                     24,
                     "#ffcc00",
                 );
-                const t = CAR_TYPES[carSelIdx];
+                const t = CAR_TYPES[ui.carSelIdx];
 
                 // Podium + rotating car
                 const podY = cy - h / 2 + 150;
@@ -6598,6 +7244,14 @@
                     ctx.strokeRect(cx - barW / 2, y, barW, 14);
                 }
 
+                ctx.font = "11px monospace";
+                ctx.textAlign = "center";
+                ctx.fillStyle = "#777";
+                ctx.fillText(
+                    "DRAG & DROP CAR FILES OR A FOLDER HERE TO ADD YOUR OWN",
+                    cx,
+                    cy + h / 2 - 36,
+                );
                 ctx.font = "bold 13px monospace";
                 ctx.textAlign = "center";
                 ctx.fillStyle = "#bbb";
@@ -6627,7 +7281,7 @@
                         row = Math.floor(i / 3);
                     const x = cx + (col - 1) * cellW;
                     const y = cy - h / 2 + 75 + row * cellH;
-                    const sel = i === trackSelIdx;
+                    const sel = i === ui.trackSelIdx;
                     const pv = levelPreviews[i];
                     const pw = 132;
 
@@ -6679,7 +7333,7 @@
                 ctx.textAlign = "center";
                 ctx.fillStyle = "#bbb";
                 ctx.fillText(
-                    LEVELS[trackSelIdx].desc +
+                    LEVELS[ui.trackSelIdx].desc +
                         "      ENTER · RACE      ESC · BACK",
                     cx,
                     cy + h / 2 - 16,
@@ -6898,7 +7552,7 @@
                 const items = ["RESUME", "RESTART RACE", "QUIT TO MENU"];
                 for (let i = 0; i < items.length; i++) {
                     const y = cy - 20 + i * 48;
-                    const sel = i === pauseIdx;
+                    const sel = i === ui.pauseIdx;
                     if (sel) {
                         ctx.fillStyle = "rgba(255, 204, 0, 0.12)";
                         ctx.fillRect(cx - w / 2 + 18, y - 24, w - 36, 36);
@@ -7028,12 +7682,12 @@
             }
 
             function drawSoundToast() {
-                if (!soundToast) return;
-                const age = performance.now() - soundToast;
+                if (!audio.soundToast) return;
+                const age = performance.now() - audio.soundToast;
                 if (age > 1200) return;
                 ctx.globalAlpha = Math.max(0, 1 - age / 1200);
                 chunkyText(
-                    "SOUND " + (soundOn ? "ON" : "OFF"),
+                    "SOUND " + (audio.soundOn ? "ON" : "OFF"),
                     canvas.width / 2,
                     110,
                     22,
@@ -7089,12 +7743,27 @@
                 }
 
                 drawSoundToast();
-                if (showFPS) drawFPSGraph();
+                if (debug.showFPS) drawFPSGraph();
                 if (
-                    showTuning &&
+                    debug.showTuning &&
                     (gameState === STATE.RACING || gameState === STATE.PAUSED)
                 )
                     drawTuningPanel();
+
+                if (dropNotice) {
+                    if (performance.now() > dropNotice.until) {
+                        dropNotice = null;
+                    } else {
+                        ctx.font = "bold 14px monospace";
+                        ctx.textAlign = "center";
+                        ctx.fillStyle = dropNotice.color;
+                        ctx.fillText(
+                            dropNotice.text,
+                            canvas.width / 2,
+                            canvas.height - 14,
+                        );
+                    }
+                }
 
                 requestAnimationFrame(gameLoop);
             }
@@ -7126,6 +7795,26 @@
                 startLevel,
                 finalizeRace,
                 enterTitle,
+                // Worldgen access for tools/verify.mjs (regression hashes)
+                generateWorld,
+                get trackMap() {
+                    return trackMap;
+                },
+                get heightMap() {
+                    return heightMap;
+                },
+                get elevationMap() {
+                    return elevationMap;
+                },
+                get trackBanking() {
+                    return trackBanking;
+                },
+                get checkpoints() {
+                    return checkpoints;
+                },
+                get scenery() {
+                    return scenery;
+                },
             };
 
             // ── Init ───────────────────────────────────────────────────────────────
@@ -7141,6 +7830,12 @@
             }
             queueLoad("SETTING THE SCENE", enterTitleNow);
             loadTotal = loadQueue.length;
+            // Cars dropped onto the page in earlier sessions come back
+            // from localStorage; manifest cars override them by name.
+            restoreStoredCars();
+            // Fire-and-forget: custom cars append to CAR_TYPES whenever
+            // their fetches land; the car-select UI reads the array live.
+            loadCustomCars();
             requestAnimationFrame(gameLoop);
         </script>
     </body>
